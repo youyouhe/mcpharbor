@@ -1,0 +1,19 @@
+[project]
+name = "mcpharbor"
+version = "0.1.0"
+description = "MCP Harbor - 契约注册、发现与通知中心"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.0",
+    "pydantic>=2.0",
+]
+
+[project.scripts]
+mcpharbor = "mcpharbor.server:main"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[tool.setuptools.packages.find]
+where = ["src"]

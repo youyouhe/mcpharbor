@@ -1,0 +1,1365 @@
+"""MCP Harbor Server - 契约注册、发现与通知中心。"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import html
+import json
+import os
+import re
+import secrets
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any
+
+import mcp.types as mcp_types
+from fastmcp import Context, FastMCP
+from mcp.server.session import ServerSession
+
+from .models import (
+    AuditEntry, Berth, BerthStatus, Contract, DirectMessage, Manifest,
+    Notification, NotifyPriority, Subscription,
+)
+from .storage import HarborStorage
+
+# 会话健康状态：agent_id -> {"alive": bool, "checked_at": iso}
+# 心跳只探测、只记录、只展示，绝不把会话从 _live_sessions 踢掉。
+_session_health: dict[str, dict[str, Any]] = {}
+_HEARTBEAT_INTERVAL_SECONDS = 30
+_HEARTBEAT_TIMEOUT_SECONDS = 5
+
+
+async def _heartbeat_loop() -> None:
+    """定时对登记在册的活跃会话发 MCP ping，记录存活状态。"""
+    while True:
+        for agent_id, session in list(_live_sessions.items()):
+            alive = True
+            try:
+                await asyncio.wait_for(session.send_ping(), timeout=_HEARTBEAT_TIMEOUT_SECONDS)
+            except Exception:
+                alive = False
+            _session_health[agent_id] = {
+                "alive": alive,
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+            }
+        await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
+
+
+@asynccontextmanager
+async def _harbor_lifespan(server):
+    """服务启动时拉起心跳循环，关闭时停掉。"""
+    task = asyncio.create_task(_heartbeat_loop())
+    yield
+    task.cancel()
+
+
+mcp = FastMCP(
+    "MCP Harbor",
+    instructions="契约注册、发现与通知中心 - 各 Agent 项目的契约港",
+    lifespan=_harbor_lifespan,
+)
+
+_store: HarborStorage | None = None
+
+# Agent 订阅时（harbor.subscribe）留下的活跃会话，仅用于原生通知推送。
+# 只在多客户端共享的传输（如 streamable-http）下才跨 agent 有效；
+# stdio 下每个 agent 是独立进程，推送不到彼此，只能靠 harbor.check_updates 轮询兜底。
+_live_sessions: dict[str, ServerSession] = {}
+
+# "admin" 是 harbor.admin_command 用来标记发件人的保留身份，不能被普通 agent 注册，
+# 否则谁都能抢注这个名字，冒充真正的（用 MCPHARBOR_ADMIN_TOKEN 认证的）admin。
+_RESERVED_AGENT_IDS = {"admin"}
+
+
+def _get_store() -> HarborStorage:
+    global _store
+    if _store is None:
+        _store = HarborStorage()
+    return _store
+
+
+def _audit(action: str, actor: str, target: str, detail: dict[str, Any] | None = None) -> None:
+    entry = AuditEntry(action=action, actor=actor, target=target, detail=detail or {})
+    _get_store().log_audit(entry)
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _generate_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+async def _push_notification(recipient: str, resource_uri: str, **extra: Any) -> bool:
+    """尝试向 recipient 当前存活的会话推送 notifications/resources/updated。
+
+    找不到活跃会话，或推送失败（连接已断开），返回 False，交给轮询/收件箱兜底。
+    """
+    session = _live_sessions.get(recipient)
+    if session is None:
+        return False
+    try:
+        await session.send_notification(
+            mcp_types.ServerNotification(
+                mcp_types.ResourceUpdatedNotification(
+                    params=mcp_types.ResourceUpdatedNotificationParams(
+                        uri=resource_uri, **extra,
+                    ),
+                )
+            )
+        )
+        return True
+    except Exception:
+        _live_sessions.pop(recipient, None)
+        return False
+
+
+def _check_auth(agent_id: str, token: str) -> str | None:
+    """校验 agent_id 与 token 是否匹配。返回错误信息，通过则返回 None。"""
+    store = _get_store()
+    existing = store.get_agent_token(agent_id)
+    if existing is None:
+        return f"agent_id={agent_id} 未注册，请先调用 harbor.register_agent"
+    if not store.verify_agent_token(agent_id, _hash_token(token)):
+        return f"agent_id={agent_id} 的 token 无效"
+    store.touch_agent_last_seen(agent_id)
+    return None
+
+
+def _check_admin(admin_token: str) -> str | None:
+    """校验 admin_token。未配置 MCPHARBOR_ADMIN_TOKEN 时，管理功能整体不可用（fail closed）。"""
+    expected = os.environ.get("MCPHARBOR_ADMIN_TOKEN", "")
+    if not expected:
+        return "admin 功能未启用：请在启动 Harbor 前设置环境变量 MCPHARBOR_ADMIN_TOKEN"
+    if not admin_token or not secrets.compare_digest(admin_token, expected):
+        return "admin_token 无效"
+    return None
+
+
+def _collect_admin_overview() -> dict[str, Any]:
+    """汇总 Harbor 全貌，仅供 admin 使用。私信只给计数，不带正文。"""
+    store = _get_store()
+    agents = store.list_agents()
+    berths = store.list_all_berths()
+    subs = store.list_all_subscriptions()
+    return {
+        "agents": [
+            {
+                "agent_id": a.agent_id,
+                "display_name": a.display_name or "（未登记）",
+                "description": a.description or "（未登记）",
+                "contact": a.contact or "",
+                "created_at": a.created_at.isoformat(),
+                "last_seen": a.last_seen.isoformat() if a.last_seen else "从未活跃",
+                "heartbeat": (
+                    ("🟢 存活" if h["alive"] else "🔴 无响应")
+                    + f"（{h['checked_at'][11:19]} UTC）"
+                ) if (h := _session_health.get(a.agent_id)) else "⏳ 未登记会话",
+                "revoked": a.revoked,
+                "online": a.agent_id in _live_sessions,
+            }
+            for a in agents
+        ],
+        "berths": [
+            {
+                "id": b.id, "owner": b.owner, "version": b.version,
+                "status": b.status.value, "capabilities": b.capabilities,
+                "contact": b.contact,
+            }
+            for b in berths
+        ],
+        "subscriptions": [
+            {
+                "subscriber": s.subscriber, "berth": s.berth,
+                "events": s.events, "version_range": s.version_range,
+            }
+            for s in subs
+        ],
+        "message_count": store.count_messages(),
+        "notification_count": store.count_notifications(),
+        "recent_notifications": [n.model_dump(mode="json") for n in store.get_notification_history(limit=20)],
+        "recent_audit": [e.model_dump(mode="json") for e in store.get_audit_log(limit=20)],
+        "live_agents": sorted(_live_sessions.keys()),
+    }
+
+
+def _render_admin_html(data: dict[str, Any], mcp_url: str = "") -> str:
+    def _rows(items: list[dict[str, Any]], cols: list[str]) -> str:
+        if not items:
+            return "<tr><td colspan='99' class='empty'>暂无数据</td></tr>"
+        out = []
+        for it in items:
+            cells = "".join(f"<td>{html.escape(str(it.get(c, '')))}</td>" for c in cols)
+            out.append(f"<tr>{cells}</tr>")
+        return "".join(out)
+
+    agents_rows = _rows(
+        [{"agent_id": a["agent_id"], "display_name": a["display_name"],
+          "description": a["description"], "contact": a["contact"],
+          "created_at": a["created_at"], "last_seen": a["last_seen"],
+          "heartbeat": a["heartbeat"],
+          "online": "🟢 在线" if a["online"] else "⚪ 离线",
+          "revoked": "已吊销" if a["revoked"] else "正常"}
+         for a in data["agents"]],
+        ["agent_id", "display_name", "description", "contact", "created_at", "last_seen", "heartbeat", "online", "revoked"],
+    )
+    berths_rows = _rows(data["berths"], ["id", "owner", "version", "status", "capabilities", "contact"])
+    subs_rows = _rows(data["subscriptions"], ["subscriber", "berth", "events", "version_range"])
+    notif_rows = _rows(
+        [{"created_at": n["created_at"], "berth": n["berth"], "old_version": n["old_version"],
+          "new_version": n["new_version"], "severity": n["severity"], "summary": n["summary"]}
+         for n in data["recent_notifications"]],
+        ["created_at", "berth", "old_version", "new_version", "severity", "summary"],
+    )
+    audit_rows = _rows(
+        [{"timestamp": e["timestamp"], "action": e["action"], "actor": e["actor"], "target": e["target"]}
+         for e in data["recent_audit"]],
+        ["timestamp", "action", "actor", "target"],
+    )
+
+    mcp_url_safe = html.escape(mcp_url) if mcp_url else ""
+    if mcp_url_safe:
+        connection_card = f"""
+<div class="card connect">
+  <h2>🔌 MCP 连接信息</h2>
+  <div class="connect-row">
+    <span class="label">Server URL</span>
+    <code class="url" id="mcpUrl">{mcp_url_safe}</code>
+    <button class="copy-btn" onclick="navigator.clipboard.writeText(document.getElementById('mcpUrl').textContent)">复制</button>
+  </div>
+  <div class="connect-row"><span class="label">Transport</span><code>streamable-http</code></div>
+  <div class="connect-row"><span class="label">Claude Code 接入</span>
+    <code>claude mcp add --transport http harbor "{mcp_url_safe}"</code>
+  </div>
+  <p class="hint">当前局域网内使用：把上面的地址换成同一网段能访问到的 IP（不要用 127.0.0.1）即可从其他机器连接。写操作需要先 <code>harbor.register_agent</code> 拿 token。</p>
+</div>"""
+    else:
+        connection_card = ""
+
+    tools_card = """
+<div class="card connect" style="border-left-color:#16a34a;">
+  <h2>🧰 工具清单与"没有工具"排查</h2>
+  <p class="hint" style="margin:0 0 0.6rem;">Harbor 共 <b>19 个工具</b>，实际暴露的工具名<b>不带 <code>harbor.</code> 前缀</b>（README 里的 <code>harbor.xxx</code> 只是文档写法）：<code>register_agent</code>、<code>rotate_token</code>、<code>publish_manifest</code>、<code>get_manifest</code>、<code>search_berths</code>、<code>subscribe</code>、<code>open_session</code>、<code>send_message</code>、<code>get_messages</code>、<code>mark_messages_read</code>、<code>admin_command</code>、<code>notify</code>、<code>resolve_dependency</code>、<code>check_compat</code>、<code>check_updates</code>、<code>sync</code>、<code>diff_versions</code>、<code>get_notifications</code>、<code>get_audit_log</code>。</p>
+  <p class="hint" style="margin:0;">如果某个 Agent 连上后说"只看到资源、没有工具"，问题几乎都在客户端侧，按概率排查：
+    ① 客户端 MCP 实现残缺——不少网页聊天 Agent 只调 <code>resources/list</code> 不调 <code>tools/list</code>，能看到 <code>harbor://berths</code> 说明连接是通的；
+    ② 按 <code>harbor.*</code> 前缀找工具——实际是裸名字；
+    ③ transport/端点不匹配——streamable-http 端点是 <code>/mcp</code>，有的客户端只连 <code>/sse</code>。
+    服务端自检：用 fastmcp Client 连上来跑 <code>list_tools()</code>，能看到 19 个工具就说明问题在对方。</p>
+  <p class="hint" style="margin:0.4rem 0 0;">📌 注册新规：<code>register_agent</code> 必须提交 <code>display_name</code>（显示名）和 <code>description</code>（身份用途），agent_id 仅限小写字母/数字/连字符；同一 agent_id 重复注册会被拒绝——一个 Agent 只需要一个身份。</p>
+</div>"""
+
+    # 来源：https://opencode.ai/docs/github/ （schedule 事件）
+    scheduled_card = """
+<div class="card connect" style="border-left-color:#8b5cf6;">
+  <h2>⏰ OpenCode 定时任务配置</h2>
+  <p class="hint" style="margin:0 0 0.8rem;">OpenCode 本身没有内置 cron，官方推荐的定时方式是在 GitHub Actions 里用 <code>schedule</code> 事件触发 <code>anomalyco/opencode/github</code> action。定时事件没有评论上下文，<code>prompt</code> 必填；要让它建分支/开 PR，需授予 <code>contents: write</code> 和 <code>pull-requests: write</code>。输出写入 Actions 日志和 PR（没有 issue 可评论）。自建部署也可以用系统 crontab + <code>opencode serve</code> 的 HTTP API（<code>POST /session/:id/message</code>）定时下发任务。</p>
+<pre class="codeblock"># .github/workflows/opencode-scheduled.yml
+name: Scheduled OpenCode Task
+on:
+  schedule:
+    - cron: "0 9 * * 1"   # 每周一 UTC 9 点
+jobs:
+  opencode:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Run OpenCode
+        uses: anomalyco/opencode/github@latest
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        with:
+          model: anthropic/claude-sonnet-4-20250514
+          prompt: |
+            Review the codebase for any TODO comments and create a summary.
+            If you find issues worth addressing, open an issue to track them.</pre>
+</div>"""
+
+    # 来源：https://github.com/youyouhe/omp-cron-extension
+    omp_cron_card = """
+<div class="card connect" style="border-left-color:#e11d48;">
+  <h2>🎯 OMP 会话内定时任务插件（omp-cron-extension）</h2>
+  <p class="hint" style="margin:0 0 0.6rem;">单文件 TypeScript 插件，给 OMP（Oh My Pi）Agent 运行时注入三个 LLM 工具：<code>cron_add</code>（新建）、<code>cron_list</code>（查看）、<code>cron_remove</code>（删除）。零依赖、无构建步骤，Agent 在对话中用自然语言即可创建定时任务，到点自动驱动当前会话执行。</p>
+  <p class="hint" style="margin:0 0 0.6rem;">
+    <b>三种调度方式</b>（三选一）：<code>every_seconds</code> 固定间隔（≥5s）/ <code>daily_at</code> 每天定点（"HH:MM"，本机时区）/ <code>once_in_seconds</code> 一次性延时（≥5s）。<br>
+    <b>会话忙碌时</b>：<code>on_busy=queue</code>（默认）排队等当前任务完成再执行，<code>on_busy=cancel</code> 取消本次触发（一次性任务即移除，周期任务照常顺延）。<br>
+    <b>安全约束</b>：最小间隔 5 秒、单会话最多 32 个任务、定时器走 <code>ctx.setInterval</code> 托管通道。<br>
+    任务写入会话文件持久化，重启/切分支后自动恢复；错过的任务补跑一次，不堆积。
+  </p>
+  <pre class="codeblock"># 安装方式（二选一）：
+git clone https://github.com/youyouhe/omp-cron-extension.git
+
+# 全局安装：所有 omp 会话加载
+ln -s "$(pwd)/cron.ts" ~/.omp/agent/extensions/cron.ts
+
+# 项目级安装：仅从该项目目录启动的会话加载
+mkdir -p /path/to/your/project/.omp/extensions
+cp cron.ts /path/to/your/project/.omp/extensions/
+
+# 重启 omp 会话生效，输入 /cron 验证是否加载成功
+
+# 用法示例（直接用自然语言对话）：
+#   「每 5 分钟检查一次 git status，有未提交变更就提醒我」
+#   「每天 09:30 总结一下昨天的提交」
+#   「10 分钟后提醒我重新部署」
+
+# cron_add 参数（三调度字段必填其一，且只能填一个）：
+#   name          任务名（≤80 字符）
+#   prompt        到点后注入会话的指令（≤4000 字符）
+#   every_seconds 固定间隔秒数，≥5
+#   daily_at      每天定点，"HH:MM" 24 小时制
+#   once_in_seconds 一次性延时秒数，≥5
+#   on_busy       queue（默认排队）/ cancel（取消本次）</pre>
+</div>"""
+
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>MCP Harbor Admin</title>
+<style>
+* {{ box-sizing: border-box; }}
+body {{
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  margin: 0; padding: 2rem; color: #1e293b; background: #f1f5f9;
+  line-height: 1.5;
+}}
+.wrap {{ max-width: 1100px; margin: 0 auto; }}
+h1 {{ margin: 0 0 0.3rem; font-size: 1.6rem; }}
+.subtitle {{ color: #64748b; margin: 0 0 1.5rem; font-size: 0.9rem; }}
+h2 {{ margin: 0 0 0.8rem; font-size: 1.05rem; color: #0f172a; }}
+.card {{
+  background: white; border-radius: 10px; padding: 1.2rem 1.4rem;
+  margin-bottom: 1.2rem; box-shadow: 0 1px 3px rgba(0,0,0,0.08); border: 1px solid #e2e8f0;
+}}
+.stats {{ display: flex; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.2rem; }}
+.stat {{
+  flex: 1; min-width: 140px; background: white; border-radius: 10px; padding: 1rem 1.2rem;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.08); border: 1px solid #e2e8f0;
+}}
+.stat b {{ font-size: 1.8rem; display: block; color: #2563eb; }}
+.stat span {{ font-size: 0.82rem; color: #64748b; }}
+table {{ border-collapse: collapse; width: 100%; margin-top: 0.3rem; }}
+th, td {{ padding: 7px 12px; text-align: left; font-size: 0.86rem; border-bottom: 1px solid #eef1f5; }}
+th {{ color: #64748b; font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.03em; }}
+tr:hover td {{ background: #f8fafc; }}
+.empty {{ text-align: center; color: #94a3b8; padding: 1rem; }}
+.connect {{ border-left: 4px solid #2563eb; }}
+.connect-row {{ display: flex; align-items: center; gap: 0.6rem; margin: 0.5rem 0; flex-wrap: wrap; }}
+.connect-row .label {{ min-width: 130px; color: #64748b; font-size: 0.85rem; }}
+code {{
+  background: #f1f5f9; padding: 3px 8px; border-radius: 5px; font-size: 0.85rem;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace; color: #0f172a;
+}}
+.copy-btn {{
+  border: 1px solid #cbd5e1; background: white; border-radius: 5px; padding: 3px 10px;
+  font-size: 0.78rem; cursor: pointer; color: #334155;
+}}
+.copy-btn:hover {{ background: #f1f5f9; }}
+.hint {{ font-size: 0.8rem; color: #64748b; margin: 0.6rem 0 0; }}
+.codeblock {{
+  background: #0f172a; color: #e2e8f0; padding: 0.9rem 1rem; border-radius: 8px;
+  font-size: 0.78rem; line-height: 1.5; overflow-x: auto; white-space: pre;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace; margin: 0.4rem 0 0;
+}}
+</style></head>
+<body>
+<div class="wrap">
+<h1>🏠 MCP Harbor</h1>
+<p class="subtitle">契约注册、发现与通知中心 — 管理全貌（仅 admin 可见）</p>
+
+{connection_card}
+
+{tools_card}
+
+{scheduled_card}
+
+{omp_cron_card}
+
+<div class="stats">
+  <div class="stat"><b>{len(data['agents'])}</b><span>已注册参与者</span></div>
+  <div class="stat"><b>{len(data['live_agents'])}</b><span>当前在线</span></div>
+  <div class="stat"><b>{len(data['berths'])}</b><span>Berth</span></div>
+  <div class="stat"><b>{len(data['subscriptions'])}</b><span>活跃订阅</span></div>
+  <div class="stat"><b>{data['message_count']}</b><span>私信（仅计数）</span></div>
+  <div class="stat"><b>{data['notification_count']}</b><span>通知（累计）</span></div>
+</div>
+
+<div class="card">
+<h2>参与者（{len(data['agents'])}）</h2>
+<table><tr><th>agent_id</th><th>显示名</th><th>身份说明</th><th>联系方式</th><th>注册时间</th><th>最后活跃</th><th>心跳（每30s）</th><th>在线</th><th>状态</th></tr>{agents_rows}</table>
+<p class="hint">🧹 「最后活跃」仅在 last_seen 机制上线（2026-09-11）之后才开始记录：此前的注册即使真的活跃过也显示"从未活跃"，不能作为废弃依据。识别僵尸请以最后活跃时间（机制上线后）+ 档案登记情况 + 你自己的实际使用记忆为准；清理用 MCP 工具 <code>admin_manage_agent</code>（action=revoke 吊销 / purge 彻底删除，purge 不可恢复，动手前确认）。</p>
+</div>
+
+<div class="card">
+<h2>Berth（{len(data['berths'])}）</h2>
+<table><tr><th>id</th><th>owner</th><th>version</th><th>status</th><th>capabilities</th><th>contact</th></tr>{berths_rows}</table>
+</div>
+
+<div class="card">
+<h2>订阅关系（{len(data['subscriptions'])}）</h2>
+<table><tr><th>subscriber</th><th>berth</th><th>events</th><th>version_range</th></tr>{subs_rows}</table>
+</div>
+
+<div class="card">
+<h2>最近通知（最多20条）</h2>
+<table><tr><th>时间</th><th>berth</th><th>旧版本</th><th>新版本</th><th>优先级</th><th>摘要</th></tr>{notif_rows}</table>
+</div>
+
+<div class="card">
+<h2>最近审计（最多20条）</h2>
+<table><tr><th>时间</th><th>action</th><th>actor</th><th>target</th></tr>{audit_rows}</table>
+</div>
+
+</div>
+</body></html>"""
+
+
+def _generate_change_summary(old: Manifest | None, new: Manifest) -> str:
+    """生成变更摘要。"""
+    if old is None:
+        return f"首次发布 v{new.version}"
+
+    parts = []
+    if old.base_url != new.base_url:
+        parts.append(f"base_url: {old.base_url} -> {new.base_url}")
+    if old.auth != new.auth:
+        parts.append("认证方式已变更")
+    if set(old.capabilities) != set(new.capabilities):
+        added = set(new.capabilities) - set(old.capabilities)
+        removed = set(old.capabilities) - set(new.capabilities)
+        if added:
+            parts.append(f"新增能力: {', '.join(added)}")
+        if removed:
+            parts.append(f"移除能力: {', '.join(removed)}")
+    if old.errors != new.errors:
+        parts.append("错误码已变更")
+    if set(old.events) != set(new.events):
+        added = set(new.events) - set(old.events)
+        removed = set(old.events) - set(new.events)
+        if added:
+            parts.append(f"新增事件: {', '.join(added)}")
+        if removed:
+            parts.append(f"移除事件: {', '.join(removed)}")
+    if old.protocol != new.protocol:
+        parts.append(f"协议: {old.protocol} -> {new.protocol}")
+
+    return "；".join(parts) if parts else f"版本 {old.version} -> {new.version}"
+
+
+def _determine_priority(old: Manifest | None, new: Manifest) -> NotifyPriority:
+    """根据变更内容判断通知优先级。"""
+    if old is None:
+        return NotifyPriority.NORMAL
+
+    if old.auth != new.auth:
+        return NotifyPriority.HIGH
+    if old.protocol != new.protocol:
+        return NotifyPriority.HIGH
+
+    if old.errors != new.errors or set(old.events) != set(new.events):
+        return NotifyPriority.NORMAL
+
+    return NotifyPriority.LOW
+
+
+async def _notify_subscribers(
+    berth: str,
+    old_version: str,
+    new_version: str,
+    summary: str,
+    priority: NotifyPriority,
+    actor: str = "system",
+) -> tuple[list[dict[str, Any]], int]:
+    """通知订阅者，支持5秒合并，并尝试原生推送给当前存活会话。"""
+    store = _get_store()
+    resource_uri = f"harbor://berths/{berth}/manifest"
+
+    recent = store.get_recent_notifications(berth, within_seconds=5)
+    if recent:
+        merged_ids = [n.id for n in recent] + [recent[0].id]
+        store.mark_notification_merged(merged_ids, recent[0].id)
+        notif = Notification(
+            berth=berth, old_version=old_version, new_version=new_version,
+            change_type="contract_changed", severity=priority,
+            summary=summary, resource_uri=resource_uri,
+            merged=True, merged_ids=merged_ids,
+        )
+        store.add_notification(notif)
+        audit_action = "notify.merged"
+        audit_detail = {
+            "old_version": old_version, "new_version": new_version,
+            "merged_count": len(merged_ids),
+        }
+    else:
+        notif = Notification(
+            berth=berth, old_version=old_version, new_version=new_version,
+            change_type="contract_changed", severity=priority,
+            summary=summary, resource_uri=resource_uri,
+        )
+        store.add_notification(notif)
+        audit_action = "notify.send"
+        audit_detail = {
+            "old_version": old_version, "new_version": new_version,
+            "severity": priority.value,
+        }
+
+    subs = store.get_subscriptions(berth)
+    recipients = []
+    pushed = 0
+    for sub in subs:
+        if not sub.events or any(e in sub.events for e in ["*", "contract_changed", "manifest.updated"]):
+            recipients.append({
+                "subscriber": sub.subscriber,
+                "callback": sub.callback,
+                "resource_uri": sub.resource_uri,
+            })
+            ok = await _push_notification(
+                sub.subscriber, sub.resource_uri or resource_uri,
+                berth=berth, old_version=old_version, new_version=new_version,
+                change_type="contract_changed", severity=priority.value, summary=summary,
+            )
+            if ok:
+                pushed += 1
+
+    audit_detail["pushed"] = pushed
+    _audit(audit_action, actor, f"berth:{berth}", audit_detail)
+
+    return recipients, pushed
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Tools - 写和交互
+# ═══════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+def register_agent(agent_id: str, display_name: str, description: str, contact: str = "") -> str:
+    """注册 Agent 身份，获取用于写操作的 token。
+
+    注册时必须提交身份档案：
+    - agent_id：小写字母/数字/连字符组成的唯一标识（如 wangxiaoya）
+    - display_name：显示名（如"王小丫"）
+    - description：这个身份是干什么的、为什么需要它（一个 Agent 只需要注册一个身份）
+    - contact：联系方式（可选）
+
+    每个 agent_id 只能注册一次；token 只在本次调用中返回一次，请妥善保存。
+    若已注册会直接拒绝——不要换名字重复注册，需要更换 token 请用 rotate_token。
+    """
+    store = _get_store()
+    if agent_id in _RESERVED_AGENT_IDS:
+        return json.dumps({
+            "error": f"agent_id={agent_id} 是保留身份，不能自行注册",
+        }, ensure_ascii=False)
+    if not re.fullmatch(r"[a-z0-9]([a-z0-9\-]*[a-z0-9])?", agent_id) or len(agent_id) > 128:
+        return json.dumps({
+            "error": "agent_id 只能是小写字母、数字、连字符组成，且以字母或数字开头结尾（如 wangxiaoya）",
+        }, ensure_ascii=False)
+    display_name = display_name.strip()
+    description = description.strip()
+    if not display_name:
+        return json.dumps({"error": "display_name 必填：请提供这个身份的显示名"}, ensure_ascii=False)
+    if len(description) < 5:
+        return json.dumps({
+            "error": "description 必填：请说明这个身份的用途/职责（至少 5 个字），方便其他 Agent 知道你是谁",
+        }, ensure_ascii=False)
+
+    if store.get_agent_token(agent_id) is not None:
+        return json.dumps({
+            "error": f"agent_id={agent_id} 已注册。一个 Agent 只需要一个身份，不要重复注册；"
+                     f"如需更换 token 请调用 harbor.rotate_token",
+        }, ensure_ascii=False)
+
+    token = _generate_token()
+    store.create_agent_token(
+        agent_id, _hash_token(token),
+        display_name=display_name, description=description,
+        contact=contact.strip(),
+    )
+    _audit("agent.register", agent_id, f"agent:{agent_id}", {
+        "display_name": display_name, "description": description,
+        "contact": contact.strip(),
+    })
+
+    return json.dumps({
+        "status": "ok",
+        "agent_id": agent_id,
+        "display_name": display_name,
+        "token": token,
+        "message": "请保存此 token，之后不会再显示。调用写操作工具时需带上此 token。",
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+def rotate_token(agent_id: str, current_token: str) -> str:
+    """使用现有 token 为 agent_id 更换新 token，旧 token 立即失效。"""
+    store = _get_store()
+    err = _check_auth(agent_id, current_token)
+    if err:
+        return json.dumps({"error": err}, ensure_ascii=False)
+
+    new_token = _generate_token()
+    store.rotate_agent_token(agent_id, _hash_token(new_token))
+    _audit("agent.rotate_token", agent_id, f"agent:{agent_id}")
+
+    return json.dumps({
+        "status": "ok",
+        "agent_id": agent_id,
+        "token": new_token,
+        "message": "token 已更换，旧 token 已失效。",
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+async def publish_manifest(
+    berth: str,
+    version: str,
+    owner: str,
+    token: str,
+    capabilities: list[str] | None = None,
+    protocol: str = "http",
+    base_url: str = "",
+    auth: dict[str, Any] | None = None,
+    requirements: list[str] | None = None,
+    errors: dict[str, str] | None = None,
+    events: list[str] | None = None,
+    contact: str = "",
+) -> str:
+    """发布或更新 Manifest（项目卡）。
+
+    如果 berth 不存在则自动注册。已存在则更新版本。
+    需要先用 owner 对应的 agent_id 调用 harbor.register_agent 获取 token。
+    发布后自动通知订阅者，包含变更摘要和优先级。
+    """
+    store = _get_store()
+
+    auth_err = _check_auth(owner, token)
+    if auth_err:
+        _audit("auth.denied", owner, f"berth:{berth}", {"reason": auth_err})
+        return json.dumps({"error": auth_err}, ensure_ascii=False)
+
+    old_manifest = store.get_manifest(berth)
+    berth_obj = store.get_berth(berth)
+
+    if berth_obj is None:
+        berth_obj = Berth(id=berth, owner=owner, version=version,
+                          capabilities=capabilities or [], contact=contact)
+        store.upsert_berth(berth_obj)
+        _audit("berth.register", owner, f"berth:{berth}", {"version": version})
+    else:
+        if berth_obj.owner != owner:
+            _audit("auth.denied", owner, f"berth:{berth}", {"reason": "owner mismatch"})
+            return json.dumps({"error": f"只有 owner({berth_obj.owner}) 可以更新 berth={berth}"}, ensure_ascii=False)
+        berth_obj.version = version
+        berth_obj.capabilities = capabilities or berth_obj.capabilities
+        berth_obj.contact = contact or berth_obj.contact
+        store.upsert_berth(berth_obj)
+
+    int_errors = {int(k): v for k, v in (errors or {}).items()}
+    manifest = Manifest(
+        berth=berth, version=version, owner=owner,
+        capabilities=capabilities or [], protocol=protocol,
+        base_url=base_url, auth=auth or {}, requirements=requirements or [],
+        errors=int_errors, events=events or [], contact=contact,
+    )
+    store.publish_manifest(manifest)
+    _audit("manifest.publish", owner, f"berth:{berth}", {"version": version})
+
+    summary = _generate_change_summary(old_manifest, manifest)
+    priority = _determine_priority(old_manifest, manifest)
+    old_version = old_manifest.version if old_manifest else ""
+    recipients, pushed = await _notify_subscribers(berth, old_version, version, summary, priority, owner)
+
+    return json.dumps({
+        "status": "ok",
+        "berth": berth,
+        "version": version,
+        "summary": summary,
+        "priority": priority.value,
+        "notified": len(recipients),
+        "pushed": pushed,
+        "message": f"Manifest v{version} 已发布到 berth={berth}",
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+def get_manifest(berth: str, version: str = "") -> str:
+    """获取指定 Berth 的最新（或指定版本）Manifest。"""
+    store = _get_store()
+    manifest = store.get_manifest(berth, version or None)
+    if manifest is None:
+        return json.dumps({"error": f"berth={berth} 的 manifest 未找到"}, ensure_ascii=False)
+    _audit("manifest.get", "mcp-client", f"berth:{berth}", {"version": manifest.version})
+    return manifest.model_dump_json(indent=2)
+
+
+@mcp.tool()
+def search_berths(
+    capability: str = "",
+    keyword: str = "",
+) -> str:
+    """按能力标签或关键词搜索 Berth。"""
+    store = _get_store()
+    berths = store.list_berths(capability=capability or None)
+
+    if keyword:
+        keyword_lower = keyword.lower()
+        berths = [
+            b for b in berths
+            if keyword_lower in b.id.lower()
+            or keyword_lower in b.owner.lower()
+            or keyword_lower in b.contact.lower()
+            or any(keyword_lower in c.lower() for c in b.capabilities)
+        ]
+
+    _audit("berth.search", "mcp-client", "all", {
+        "capability": capability, "keyword": keyword, "count": len(berths)
+    })
+
+    results = [
+        {
+            "berth": b.id, "owner": b.owner, "version": b.version,
+            "capabilities": b.capabilities, "status": b.status.value,
+            "contact": b.contact,
+        }
+        for b in berths
+    ]
+    return json.dumps({"berths": results, "count": len(results)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def subscribe(
+    subscriber: str,
+    token: str,
+    berth: str,
+    events: list[str] | None = None,
+    version_range: str = "*",
+    callback: str = "",
+    resource_uri: str = "",
+    ctx: Context | None = None,
+) -> str:
+    """订阅某个 Berth 的变更通知。
+
+    需要先用 subscriber 对应的 agent_id 调用 harbor.register_agent 获取 token——
+    否则任何人都能冒充别人的身份订阅，把本该发给别人的推送和私信截到自己手里。
+    events: 感兴趣的事件列表，如 ["contract_changed", "user.created"]，空列表=所有事件
+    version_range: 版本范围，如 ">=1.2.0", "^1.0.0", "*"
+    callback: 通知回调地址
+    resource_uri: MCP 资源 URI，用于原生通知
+    """
+    store = _get_store()
+
+    auth_err = _check_auth(subscriber, token)
+    if auth_err:
+        _audit("auth.denied", subscriber, f"berth:{berth}", {"reason": auth_err})
+        return json.dumps({"error": auth_err}, ensure_ascii=False)
+
+    berth_obj = store.get_berth(berth)
+    if berth_obj is None:
+        return json.dumps({"error": f"berth={berth} 不存在"}, ensure_ascii=False)
+
+    sub = Subscription(
+        subscriber=subscriber, berth=berth,
+        events=events or [], version_range=version_range,
+        callback=callback, resource_uri=resource_uri,
+    )
+    store.add_subscription(sub)
+    _audit("subscribe", subscriber, f"berth:{berth}", {
+        "subscription_id": sub.id, "events": events or [],
+        "version_range": version_range,
+    })
+
+    if ctx is not None:
+        _live_sessions[subscriber] = ctx.session
+
+    return json.dumps({
+        "status": "ok",
+        "subscription_id": sub.id,
+        "message": f"{subscriber} 已订阅 berth={berth}",
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+def open_session(agent_id: str, token: str, ctx: Context | None = None) -> str:
+    """在不订阅任何 berth 的情况下，把当前连接注册为 agent_id 的存活会话。
+
+    仅用于希望接收 harbor.send_message 私信原生推送、但不关心 berth 契约变更的场景。
+    """
+    auth_err = _check_auth(agent_id, token)
+    if auth_err:
+        return json.dumps({"error": auth_err}, ensure_ascii=False)
+
+    if ctx is not None:
+        _live_sessions[agent_id] = ctx.session
+
+    return json.dumps({
+        "status": "ok",
+        "agent_id": agent_id,
+        "message": f"{agent_id} 的会话已注册，可接收原生推送。",
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+async def send_message(
+    from_agent: str,
+    token: str,
+    to_agent: str,
+    message: str,
+    berth: str = "",
+    correlation_id: str = "",
+    severity: str = "normal",
+) -> str:
+    """向指定 agent 发送点对点私信，只有 from_agent/to_agent 双方可见。
+
+    与 harbor.notify（向 berth 全部订阅者广播）不同：这是定向消息，第三方即使订阅了
+    同一个 berth 也看不到内容，也无法通过 harbor.get_messages 查到（需要各自的 token）。
+    """
+    store = _get_store()
+
+    auth_err = _check_auth(from_agent, token)
+    if auth_err:
+        _audit("auth.denied", from_agent, f"agent:{to_agent}", {"reason": auth_err})
+        return json.dumps({"error": auth_err}, ensure_ascii=False)
+
+    if store.get_agent_token(to_agent) is None:
+        return json.dumps({"error": f"收件人 agent_id={to_agent} 未注册"}, ensure_ascii=False)
+
+    pri = NotifyPriority.NORMAL
+    try:
+        pri = NotifyPriority(severity)
+    except ValueError:
+        pass
+
+    msg = DirectMessage(
+        from_agent=from_agent, to_agent=to_agent, berth=berth,
+        message=message, correlation_id=correlation_id, severity=pri,
+    )
+    store.add_message(msg)
+    # 审计里不记录消息正文：audit_log 目前对任何调用者开放可查，写进去等于白做隔离。
+    _audit("message.send", from_agent, f"agent:{to_agent}", {
+        "message_id": msg.id, "correlation_id": correlation_id, "severity": severity,
+    })
+
+    pushed = await _push_notification(
+        to_agent, f"harbor://messages/{to_agent}",
+        change_type="direct_message", from_agent=from_agent, to_agent=to_agent,
+        berth=berth, correlation_id=correlation_id, severity=severity, summary=message,
+    )
+
+    return json.dumps({
+        "status": "ok",
+        "message_id": msg.id,
+        "to": to_agent,
+        "pushed": pushed,
+        "message": f"已发送给 {to_agent}" + ("（已原生推送）" if pushed else "（对方不在线，等待其轮询收件箱）"),
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+def get_messages(
+    agent_id: str,
+    token: str,
+    with_agent: str = "",
+    unread_only: bool = False,
+    limit: int = 50,
+) -> str:
+    """查询自己的私信（作为收件人或发件人），需要自己的 token——第三方无法查看。"""
+    store = _get_store()
+
+    auth_err = _check_auth(agent_id, token)
+    if auth_err:
+        return json.dumps({"error": auth_err}, ensure_ascii=False)
+
+    msgs = store.get_messages(agent_id, with_agent=with_agent or None,
+                              unread_only=unread_only, limit=limit)
+    return json.dumps({
+        "messages": [m.model_dump(mode="json") for m in msgs],
+        "count": len(msgs),
+    }, ensure_ascii=False, default=str)
+
+
+@mcp.tool()
+def mark_messages_read(agent_id: str, token: str, message_ids: list[str]) -> str:
+    """把发给自己的私信标记为已读，方便下次只拉取新消息（unread_only=True）。"""
+    store = _get_store()
+
+    auth_err = _check_auth(agent_id, token)
+    if auth_err:
+        return json.dumps({"error": auth_err}, ensure_ascii=False)
+
+    count = store.mark_messages_read(agent_id, message_ids)
+    _audit("message.read", agent_id, "self", {"marked": count})
+
+    return json.dumps({"status": "ok", "marked": count}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def admin_command(admin_token: str, to_agent: str, command: str, correlation_id: str = "") -> str:
+    """admin 直接向某个 agent 下一句指令，不做任务状态跟踪——发出去就完了。
+
+    需要真正的 MCPHARBOR_ADMIN_TOKEN（不是随便一个 agent 自己的 token），这样收件人
+    才能确定这是 Harbor 运维方下的命令，而不是某个平级 agent 冒充的。收件人用
+    harbor.get_messages 查收（from_agent="admin"，severity="high"），跟私信走同一套
+    存储和推送机制。
+    """
+    err = _check_admin(admin_token)
+    if err:
+        return json.dumps({"error": err}, ensure_ascii=False)
+
+    store = _get_store()
+    if store.get_agent_token(to_agent) is None:
+        return json.dumps({"error": f"agent_id={to_agent} 未注册"}, ensure_ascii=False)
+
+    msg = DirectMessage(
+        from_agent="admin", to_agent=to_agent, message=command,
+        correlation_id=correlation_id, severity=NotifyPriority.HIGH,
+    )
+    store.add_message(msg)
+    _audit("admin.command", "admin", f"agent:{to_agent}", {
+        "message_id": msg.id, "correlation_id": correlation_id,
+    })
+
+    pushed = await _push_notification(
+        to_agent, f"harbor://messages/{to_agent}",
+        change_type="admin_command", from_agent="admin", to_agent=to_agent,
+        correlation_id=correlation_id, severity="high", summary=command,
+    )
+
+    return json.dumps({
+        "status": "ok",
+        "message_id": msg.id,
+        "to": to_agent,
+        "pushed": pushed,
+        "message": f"已向 {to_agent} 下发指令" + ("（已原生推送）" if pushed else "（对方不在线，等待其查收件箱）"),
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+def admin_manage_agent(admin_token: str, agent_id: str, action: str) -> str:
+    """admin 清理废弃/异常的 agent 注册。action 二选一：
+
+    - "revoke"：吊销——token 立即失效、踢下线，但注册记录保留可追溯（推荐先用这个）。
+    - "purge"：彻底删除——连注册记录和它的全部订阅一起删掉，不可恢复。
+      若该 agent 还拥有 berth（发布了项目卡），会被拒绝，需先处理 berth。
+
+    识别僵尸的依据（admin 面板可看）：display_name/description 为"未登记"（新规前注册）、
+    last_seen 为空或很久以前、长期离线。重复注册的垃圾身份（如同一 Agent 注册了多个名字）
+    保留一个在用的，其余 purge 掉即可。
+    """
+    err = _check_admin(admin_token)
+    if err:
+        return json.dumps({"error": err}, ensure_ascii=False)
+    if action not in ("revoke", "purge"):
+        return json.dumps({"error": "action 只能是 revoke（吊销）或 purge（彻底删除）"}, ensure_ascii=False)
+
+    store = _get_store()
+    if store.get_agent_token(agent_id) is None:
+        return json.dumps({"error": f"agent_id={agent_id} 未注册"}, ensure_ascii=False)
+
+    if action == "revoke":
+        store.revoke_agent(agent_id)
+        _live_sessions.pop(agent_id, None)
+        _audit("admin.revoke_agent", "admin", f"agent:{agent_id}", {})
+        return json.dumps({
+            "status": "ok", "action": "revoke", "agent_id": agent_id,
+            "message": f"已吊销 {agent_id}：token 立即失效，注册记录保留。若确定不再需要，可再用 action=purge 彻底删除。",
+        }, ensure_ascii=False)
+
+    # purge：先检查名下是否有 berth
+    owned = [b.id for b in store.list_all_berths() if b.owner == agent_id]
+    if owned:
+        return json.dumps({
+            "error": f"agent_id={agent_id} 名下还有 berth：{owned}。"
+                     f"请先让 owner 转移或下架这些 berth（或用 admin 直接处理），再 purge，"
+                     f"否则这些项目卡会变成无主状态。",
+        }, ensure_ascii=False)
+
+    removed_subs = store.purge_agent(agent_id)
+    _live_sessions.pop(agent_id, None)
+    _audit("admin.purge_agent", "admin", f"agent:{agent_id}", {"removed_subscriptions": removed_subs})
+    return json.dumps({
+        "status": "ok", "action": "purge", "agent_id": agent_id,
+        "removed_subscriptions": removed_subs,
+        "message": f"已彻底删除 {agent_id} 的注册记录（连带清理 {removed_subs} 条订阅）。",
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+async def notify(
+    berth: str,
+    event: str,
+    message: str = "",
+    correlation_id: str = "",
+    actor: str = "system",
+    severity: str = "normal",
+) -> str:
+    """向 berth 的订阅者发送通知。"""
+    store = _get_store()
+
+    pri = NotifyPriority.NORMAL
+    try:
+        pri = NotifyPriority(severity)
+    except ValueError:
+        pass
+
+    notif = Notification(
+        berth=berth, event=event, summary=message,
+        severity=pri, change_type=event,
+    )
+    store.add_notification(notif)
+
+    subs = store.get_subscriptions(berth)
+    matched = 0
+    pushed = 0
+    for sub in subs:
+        if not sub.events or event in sub.events or "*" in sub.events:
+            matched += 1
+            ok = await _push_notification(
+                sub.subscriber, sub.resource_uri or f"harbor://berths/{berth}/manifest",
+                berth=berth, event=event, change_type=event,
+                severity=severity, summary=message, correlation_id=correlation_id,
+            )
+            if ok:
+                pushed += 1
+
+    _audit("notify", actor, f"berth:{berth}", {
+        "event": event, "recipients": matched, "severity": severity, "pushed": pushed,
+    })
+
+    return json.dumps({
+        "status": "ok",
+        "event": event,
+        "severity": severity,
+        "notified": matched,
+        "pushed": pushed,
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+def resolve_dependency(
+    needs: list[str],
+    requester: str = "unknown",
+) -> str:
+    """解析依赖：给定所需能力列表，返回匹配的 Berth。"""
+    store = _get_store()
+    all_berths = store.list_berths()
+
+    matched: dict[str, list[str]] = {}
+    for need in needs:
+        hits = [b.id for b in all_berths if need in b.capabilities]
+        matched[need] = hits
+
+    _audit("dependency.resolve", requester, "all", {"needs": needs, "matched": matched})
+
+    return json.dumps({
+        "needs": needs,
+        "matched": matched,
+        "unresolved": [n for n, h in matched.items() if not h],
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+def check_compat(
+    berth_a: str,
+    berth_b: str,
+) -> str:
+    """检查两个 Berth 的契约兼容性。"""
+    store = _get_store()
+    m_a = store.get_manifest(berth_a)
+    m_b = store.get_manifest(berth_b)
+
+    if m_a is None:
+        return json.dumps({"error": f"berth={berth_a} 的 manifest 未找到"}, ensure_ascii=False)
+    if m_b is None:
+        return json.dumps({"error": f"berth={berth_b} 的 manifest 未找到"}, ensure_ascii=False)
+
+    issues = []
+    if m_a.protocol != m_b.protocol:
+        issues.append(f"协议不匹配: {m_a.protocol} vs {m_b.protocol}")
+    if m_a.auth.get("type") != m_b.auth.get("type"):
+        issues.append(f"认证方式不匹配: {m_a.auth.get('type')} vs {m_b.auth.get('type')}")
+
+    shared_events = set(m_a.events) & set(m_b.events)
+    a_only = set(m_a.events) - set(m_b.events)
+    b_only = set(m_b.events) - set(m_a.events)
+
+    _audit("compat.check", "mcp-client", f"{berth_a}<->{berth_b}", {
+        "compatible": len(issues) == 0, "issues": issues,
+    })
+
+    return json.dumps({
+        "berth_a": berth_a, "berth_b": berth_b,
+        "compatible": len(issues) == 0,
+        "issues": issues,
+        "shared_events": list(shared_events),
+        "a_only_events": list(a_only),
+        "b_only_events": list(b_only),
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+def check_updates(
+    known_versions: dict[str, str],
+) -> str:
+    """轮询兜底：检查已知版本是否有更新。
+
+    known_versions: {"berth_id": "known_version", ...}
+    返回有更新的 berth 列表。
+    """
+    store = _get_store()
+    updates = store.check_updates(known_versions)
+    _audit("updates.check", "mcp-client", "all", {
+        "checked": len(known_versions), "updates": len(updates),
+    })
+    return json.dumps({
+        "updates": updates,
+        "count": len(updates),
+        "message": f"检查了 {len(known_versions)} 个 berth，{len(updates)} 个有更新",
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+def sync(
+    berths: list[str],
+    requester: str = "unknown",
+) -> str:
+    """手动同步：拉取指定 Berth 的最新 Manifest。
+
+    返回各 berth 的最新 Manifest 摘要。
+    """
+    store = _get_store()
+    results = []
+    for berth_id in berths:
+        manifest = store.get_manifest(berth_id)
+        if manifest:
+            results.append({
+                "berth": manifest.berth,
+                "version": manifest.version,
+                "base_url": manifest.base_url,
+                "protocol": manifest.protocol,
+                "capabilities": manifest.capabilities,
+            })
+        else:
+            results.append({"berth": berth_id, "error": "not found"})
+
+    _audit("sync", requester, "all", {"berths": berths, "synced": len([r for r in results if "error" not in r])})
+
+    return json.dumps({"synced": results, "count": len(results)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def diff_versions(
+    berth: str,
+    version_a: str,
+    version_b: str,
+) -> str:
+    """对比两个版本的 Manifest 差异。"""
+    store = _get_store()
+    m_a = store.get_manifest(berth, version_a)
+    m_b = store.get_manifest(berth, version_b)
+
+    if m_a is None:
+        return json.dumps({"error": f"berth={berth} v{version_a} 未找到"}, ensure_ascii=False)
+    if m_b is None:
+        return json.dumps({"error": f"berth={berth} v{version_b} 未找到"}, ensure_ascii=False)
+
+    diffs: list[dict[str, Any]] = []
+    fields = ["base_url", "protocol", "capabilities", "auth", "requirements", "errors", "events", "contact"]
+    for field in fields:
+        val_a = getattr(m_a, field)
+        val_b = getattr(m_b, field)
+        if val_a != val_b:
+            diffs.append({"field": field, "old": val_a, "new": val_b})
+
+    _audit("diff.versions", "mcp-client", f"berth:{berth}", {
+        "version_a": version_a, "version_b": version_b, "diff_count": len(diffs),
+    })
+
+    return json.dumps({
+        "berth": berth,
+        "version_a": version_a,
+        "version_b": version_b,
+        "diffs": diffs,
+        "diff_count": len(diffs),
+        "summary": _generate_change_summary(m_a, m_b),
+    }, ensure_ascii=False, default=str)
+
+
+@mcp.tool()
+def get_notifications(
+    admin_token: str,
+    berth: str = "",
+    limit: int = 50,
+) -> str:
+    """查询通知历史（仅 admin）。需要 MCPHARBOR_ADMIN_TOKEN。"""
+    err = _check_admin(admin_token)
+    if err:
+        return json.dumps({"error": err}, ensure_ascii=False)
+
+    store = _get_store()
+    notifs = store.get_notification_history(berth_id=berth or None, limit=limit)
+    return json.dumps({
+        "notifications": [n.model_dump(mode="json") for n in notifs],
+        "count": len(notifs),
+    }, ensure_ascii=False, default=str)
+
+
+@mcp.tool()
+def get_audit_log(admin_token: str, limit: int = 50, action: str = "", actor: str = "", berth: str = "") -> str:
+    """查询审计日志（仅 admin）。需要 MCPHARBOR_ADMIN_TOKEN。支持按操作、操作者、Berth 过滤。"""
+    err = _check_admin(admin_token)
+    if err:
+        return json.dumps({"error": err}, ensure_ascii=False)
+
+    store = _get_store()
+    entries = store.get_audit_log(
+        limit=limit,
+        action=action or None,
+        actor=actor or None,
+        berth=berth or None,
+    )
+    return json.dumps({
+        "entries": [e.model_dump(mode="json") for e in entries],
+        "count": len(entries),
+    }, ensure_ascii=False, default=str)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Resources - 只读
+# ═══════════════════════════════════════════════════════════════════
+
+
+@mcp.resource("harbor://berths")
+def list_berths_resource() -> str:
+    """列出所有活跃 Berth。"""
+    store = _get_store()
+    berths = store.list_berths()
+    data = [
+        {"berth": b.id, "owner": b.owner, "version": b.version,
+         "capabilities": b.capabilities, "status": b.status.value}
+        for b in berths
+    ]
+    return json.dumps({"berths": data}, ensure_ascii=False)
+
+
+@mcp.resource("harbor://berths/{berth_id}/manifest")
+def manifest_resource(berth_id: str) -> str:
+    """获取指定 Berth 的最新 Manifest。"""
+    store = _get_store()
+    manifest = store.get_manifest(berth_id)
+    if manifest is None:
+        return json.dumps({"error": f"berth={berth_id} 的 manifest 未找到"}, ensure_ascii=False)
+    return manifest.model_dump_json(indent=2)
+
+
+@mcp.resource("harbor://berths/{berth_id}/contracts/{version}")
+def contract_resource(berth_id: str, version: str) -> str:
+    """获取指定 Berth 的指定版本 Contract。"""
+    store = _get_store()
+    contract = store.get_contract(berth_id, version)
+    if contract is None:
+        return json.dumps({"error": f"berth={berth_id} v{version} 的 contract 未找到"}, ensure_ascii=False)
+    return contract.model_dump_json(indent=2)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Admin 网页面板（仅在 streamable-http/sse 传输下可访问）
+# ═══════════════════════════════════════════════════════════════════
+
+@mcp.custom_route("/admin", methods=["GET"])
+async def admin_dashboard(request):
+    from starlette.responses import HTMLResponse
+
+    admin_token = request.query_params.get("token", "")
+    err = _check_admin(admin_token)
+    if err:
+        return HTMLResponse(f"<h1>403</h1><p>{html.escape(err)}</p>", status_code=403)
+
+    data = _collect_admin_overview()
+    mcp_url = str(request.base_url).rstrip("/") + "/mcp"
+    return HTMLResponse(_render_admin_html(data, mcp_url))
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Prompts - 可选
+# ═══════════════════════════════════════════════════════════════════
+
+
+@mcp.prompt()
+def onboard_berth() -> str:
+    """引导新项目接入 Harbor 的流程。"""
+    return """欢迎接入 MCP Harbor！
+
+请按以下步骤操作：
+
+1. 调用 harbor.register_agent(agent_id="你的团队名，如 auth-team") 获取 token（只显示一次，请保存）
+2. 确定你的 Berth ID（如 auth, order, payment）
+3. 准备 Manifest 信息：
+   - owner: 负责团队（必须等于第 1 步的 agent_id）
+   - capabilities: 能力标签列表
+   - protocol: 通信协议 (http/grpc/mqtt)
+   - base_url: 服务地址
+   - auth: 认证方式
+   - requirements: 调用要求
+   - errors: 错误码映射
+   - events: 可发布的事件
+
+4. 调用 harbor.publish_manifest 发布你的项目卡，带上第 1 步获取的 token
+
+示例：
+  harbor.register_agent(agent_id="auth-team")
+  # -> 返回 token，请保存
+
+  harbor.publish_manifest(
+    berth="auth",
+    version="1.0.0",
+    owner="auth-team",
+    token="<上一步返回的 token>",
+    capabilities=["auth", "jwt", "token"],
+    protocol="http",
+    base_url="https://auth.internal",
+    auth={"type": "bearer", "header": "Authorization"},
+    requirements=["所有请求必须带 X-Request-Id"],
+    errors={"401": "invalid_token", "403": "forbidden"},
+    events=["user.created", "token.revoked"]
+  )
+"""
+
+
+@mcp.prompt()
+def check_compat_prompt(berth_a: str, berth_b: str) -> str:
+    """检查两个 Berth 的兼容性。"""
+    return f"""请检查 berth={berth_a} 和 berth={berth_b} 的契约兼容性。
+
+调用 harbor.check_compat(berth_a="{berth_a}", berth_b="{berth_b}") 获取结果。
+
+兼容性检查包括：
+- 协议是否匹配
+- 认证方式是否兼容
+- 事件是否有交集
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Main
+# ═══════════════════════════════════════════════════════════════════
+
+def main():
+    """启动 MCP Harbor Server。
+
+    默认 stdio（每个 agent 独立进程，harbor.publish_manifest 的原生推送只能推给
+    同进程内的活跃会话，跨 agent 只能靠 harbor.check_updates 轮询兜底）。
+    设置环境变量 MCPHARBOR_TRANSPORT=streamable-http 可让多个 agent 共享同一个
+    Harbor 进程，这样 subscribe 后才能真正收到 notifications/resources/updated 推送。
+    """
+    transport = os.environ.get("MCPHARBOR_TRANSPORT", "stdio")
+    mcp.run(transport=transport)
+
+
+if __name__ == "__main__":
+    main()

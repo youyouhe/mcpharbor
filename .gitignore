@@ -1,0 +1,27 @@
+# 运行时 / 敏感数据
+harbor.db
+harbor.db-shm
+harbor.db-wal
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# 环境 / 密钥
+.env
+.env.*
+!*.env.example
+*.token
+.harbor_*
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
