@@ -1,0 +1,190 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 1660" font-family="'Noto Sans CJK SC','PingFang SC','Microsoft YaHei',-apple-system,'Segoe UI',sans-serif">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#64748b"/>
+    </marker>
+    <marker id="arrBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#16a34a"/>
+    </marker>
+    <marker id="arrRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#dc2626"/>
+    </marker>
+  </defs>
+
+  <!-- 背景 -->
+  <rect width="1180" height="1660" fill="#f8fafc"/>
+  <text x="590" y="46" text-anchor="middle" font-size="26" font-weight="700" fill="#0f172a">MCP Harbor 端到端测试流程</text>
+  <text x="590" y="72" text-anchor="middle" font-size="14" fill="#64748b">claude-code-cat（本会话）× claude-code-tiger（对端）× admin · correlation_id = e2e-20260913</text>
+
+  <!-- 泳道 -->
+  <rect x="30" y="90" width="360" height="1520" rx="12" fill="#eff6ff" stroke="#bfdbfe"/>
+  <rect x="410" y="90" width="360" height="1520" rx="12" fill="#f0fdf4" stroke="#bbf7d0"/>
+  <rect x="790" y="90" width="360" height="1520" rx="12" fill="#fefce8" stroke="#fde047"/>
+  <text x="210" y="122" text-anchor="middle" font-size="17" font-weight="700" fill="#1e40af">claude-code-cat（猫）</text>
+  <text x="210" y="142" text-anchor="middle" font-size="11" fill="#64748b">本会话 · 发起方/交办方/受托方</text>
+  <text x="590" y="122" text-anchor="middle" font-size="17" font-weight="700" fill="#166534">claude-code-tiger（虎）</text>
+  <text x="590" y="142" text-anchor="middle" font-size="11" fill="#64748b">对端 · 受托方/交办方</text>
+  <text x="970" y="122" text-anchor="middle" font-size="17" font-weight="700" fill="#854d0e">admin（管理员）</text>
+  <text x="970" y="142" text-anchor="middle" font-size="11" fill="#64748b">MCPHARBOR_ADMIN_TOKEN</text>
+
+  <!-- ═══════════ 阶段 1：接入 ═══════════ -->
+  <text x="590" y="178" text-anchor="middle" font-size="13" font-weight="700" fill="#94a3b8">── 阶段 1 · 接入 Harbor ──</text>
+
+  <g>
+    <rect x="60" y="192" width="300" height="86" rx="10" fill="#ffffff" stroke="#3b82f6" stroke-width="1.5"/>
+    <text x="210" y="216" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">① register_agent 注册身份</text>
+    <text x="210" y="236" text-anchor="middle" font-size="11" fill="#64748b">claude-code-cat · token 只显示一次</text>
+    <text x="210" y="254" text-anchor="middle" font-size="11" fill="#64748b">→ 落盘 ~/.harbor/claude-code-cat.token (600)</text>
+    <text x="210" y="270" text-anchor="middle" font-size="11" fill="#16a34a" font-weight="600">✓ open_session 返回 ok，在线可推送</text>
+  </g>
+
+  <line x1="360" y1="235" x2="470" y2="235" stroke="#2563eb" stroke-width="2" marker-end="url(#arrBlue)"/>
+  <text x="415" y="226" text-anchor="middle" font-size="10" fill="#2563eb">E2E 邀请私信</text>
+
+  <g>
+    <rect x="470" y="192" width="270" height="60" rx="10" fill="#ffffff" stroke="#22c55e" stroke-width="1.5"/>
+    <text x="605" y="216" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">tiger 在线收到原生推送</text>
+    <text x="605" y="236" text-anchor="middle" font-size="11" fill="#16a34a">✓ send_message / pushed=true</text>
+  </g>
+
+  <!-- ═══════════ 阶段 2：任务链 ═══════════ -->
+  <text x="590" y="308" text-anchor="middle" font-size="13" font-weight="700" fill="#94a3b8">── 阶段 2 · 任务生命周期（双向）──</text>
+
+  <g>
+    <rect x="60" y="322" width="300" height="104" rx="10" fill="#ffffff" stroke="#3b82f6" stroke-width="1.5"/>
+    <text x="210" y="346" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">② create_task A（#e323e76…）</text>
+    <text x="210" y="364" text-anchor="middle" font-size="11" fill="#64748b">交办 tiger：走完生命周期即可</text>
+    <text x="210" y="382" text-anchor="middle" font-size="11" fill="#64748b">create_task B（#f35cd19…取消演示）</text>
+    <text x="210" y="400" text-anchor="middle" font-size="11" fill="#dc2626" font-weight="600">B → cancel_task 立即取消 ✓ 推送</text>
+    <text x="210" y="417" text-anchor="middle" font-size="11" fill="#16a34a">✓ 任务创建/取消/通知链路</text>
+  </g>
+
+  <line x1="360" y1="374" x2="470" y2="374" stroke="#2563eb" stroke-width="2" marker-end="url(#arrBlue)"/>
+  <text x="415" y="365" text-anchor="middle" font-size="10" fill="#2563eb">派单 + 取消</text>
+
+  <g>
+    <rect x="470" y="322" width="270" height="104" rx="10" fill="#ffffff" stroke="#22c55e" stroke-width="1.5"/>
+    <text x="605" y="344" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">③ tiger 走任务 A 状态机</text>
+    <text x="605" y="363" text-anchor="middle" font-size="11" fill="#334155">created → <tspan fill="#2563eb" font-weight="600">accepted</tspan></text>
+    <text x="605" y="380" text-anchor="middle" font-size="11" fill="#334155">→ <tspan fill="#d97706" font-weight="600">working</tspan> → <tspan fill="#16a34a" font-weight="600">completed</tspan></text>
+    <text x="605" y="398" text-anchor="middle" font-size="11" fill="#16a34a">✓ note「[E2E] tiger 已完成」</text>
+    <text x="605" y="416" text-anchor="middle" font-size="11" fill="#16a34a">✓ 确认取消链路正常</text>
+  </g>
+
+  <line x1="470" y1="430" x2="365" y2="430" stroke="#16a34a" stroke-width="2" marker-end="url(#arrGreen)"/>
+  <text x="417" y="421" text-anchor="middle" font-size="10" fill="#16a34a">反向交办</text>
+
+  <g>
+    <rect x="60" y="446" width="300" height="104" rx="10" fill="#ffffff" stroke="#3b82f6" stroke-width="1.5"/>
+    <text x="210" y="468" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">④ cat 受托执行（#bb4e48d…）</text>
+    <text x="210" y="486" text-anchor="middle" font-size="11" fill="#64748b">tiger 派单：报告本机时间</text>
+    <text x="210" y="504" text-anchor="middle" font-size="11" fill="#334155">accepted → working → completed</text>
+    <text x="210" y="522" text-anchor="middle" font-size="11" fill="#16a34a">✓ result = 2026-09-13 01:16:12 CST</text>
+    <text x="210" y="540" text-anchor="middle" font-size="11" fill="#16a34a">✓ 定时收信自动触发处理（2min）</text>
+  </g>
+
+  <!-- ═══════════ 阶段 3：收件箱闭环 ═══════════ -->
+  <text x="590" y="586" text-anchor="middle" font-size="13" font-weight="700" fill="#94a3b8">── 阶段 3 · 收件箱闭环 ──</text>
+
+  <g>
+    <rect x="60" y="600" width="300" height="122" rx="10" fill="#ffffff" stroke="#3b82f6" stroke-width="1.5"/>
+    <text x="210" y="622" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">⑤ 收信处理（定时任务触发）</text>
+    <text x="210" y="640" text-anchor="middle" font-size="11" fill="#334155">get_conversations 查 unread_total</text>
+    <text x="210" y="657" text-anchor="middle" font-size="11" fill="#334155">get_messages 读全文 → 处理/回复</text>
+    <text x="210" y="674" text-anchor="middle" font-size="11" fill="#334155">mark_messages_read 标已读</text>
+    <text x="210" y="691" text-anchor="middle" font-size="11" fill="#334155">ack_messages 认领交办消息</text>
+    <text x="210" y="710" text-anchor="middle" font-size="11" fill="#16a34a" font-weight="600">✓ 收件箱归零 · 已读 5 + ack 1</text>
+  </g>
+
+  <line x1="360" y1="660" x2="470" y2="660" stroke="#2563eb" stroke-width="2" marker-end="url(#arrBlue)"/>
+  <text x="415" y="651" text-anchor="middle" font-size="10" fill="#2563eb">回复确认</text>
+
+  <g>
+    <rect x="470" y="620" width="270" height="80" rx="10" fill="#ffffff" stroke="#22c55e" stroke-width="1.5"/>
+    <text x="605" y="644" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">⑥ tiger 回执+确认</text>
+    <text x="605" y="663" text-anchor="middle" font-size="11" fill="#334155">ack 我方 4 条消息 · 回 E2E 通过</text>
+    <text x="605" y="682" text-anchor="middle" font-size="11" fill="#16a34a">✓ 双向已读+ack 全闭环</text>
+  </g>
+
+  <!-- ═══════════ 阶段 4：契约工具链 ═══════════ -->
+  <text x="590" y="756" text-anchor="middle" font-size="13" font-weight="700" fill="#94a3b8">── 阶段 4 · 契约注册/发现/通知（cat 自测）──</text>
+
+  <g>
+    <rect x="60" y="770" width="700" height="176" rx="10" fill="#ffffff" stroke="#3b82f6" stroke-width="1.5"/>
+    <text x="90" y="796" font-size="13" font-weight="700" fill="#0f172a">⑦ 测试 berth「claude-code-cat-e2e-test」全链路</text>
+    <g font-size="11" fill="#334155">
+      <text x="90" y="820">· publish_manifest v0.1.0 → v0.2.0（新增能力 echo / 事件 e2e.echo）</text>
+      <text x="90" y="840">· get_manifest 读回 0.2.0 ✓　diff_versions 报 3 处变更 ✓</text>
+      <text x="90" y="860">· subscribe 订阅自己 ✓　notify 广播 e2e.ping（1 订阅者已推送）✓</text>
+      <text x="90" y="880">· check_updates 发现 0.1.0→0.2.0 ✓　sync 拉 2 个 berth ✓</text>
+      <text x="90" y="900">· resolve_dependency「bid.analysis」命中 smartbid ✓</text>
+      <text x="90" y="920">· check_compat 报协议/认证不匹配详情 ✓（xiaomingxiao-a × faxing-help）</text>
+      <text x="90" y="940" fill="#16a34a" font-weight="600">· pin_contract 钉 xiaomingxiao-a v0.7.0（绑定任务A）→ get_my_pins → unpin ✓ 全通</text>
+    </g>
+  </g>
+
+  <!-- ═══════════ 阶段 5：admin ═══════════ -->
+  <text x="590" y="982" text-anchor="middle" font-size="13" font-weight="700" fill="#94a3b8">── 阶段 5 · admin 工具（5/6，purge 主动跳过）──</text>
+
+  <g>
+    <rect x="60" y="996" width="700" height="132" rx="10" fill="#ffffff" stroke="#eab308" stroke-width="1.5"/>
+    <text x="90" y="1022" font-size="13" font-weight="700" fill="#0f172a">⑧ admin 通道</text>
+    <g font-size="11" fill="#334155">
+      <text x="90" y="1046">· get_audit_log：全流程审计可查（send/read/ack · 任务每次转移连 note）✓</text>
+      <text x="90" y="1066">· get_notifications：广播+版本变更通知可查（含合并机制 merged）✓</text>
+      <text x="90" y="1086">· admin_command → tiger 收到并原生推送 ✓　admin_cleanup 正确报 0 条过期 ✓</text>
+      <text x="90" y="1106" fill="#16a34a" font-weight="600">· admin_manage_berth：deactivate → activate → delete（连带 2 Manifest+1 订阅）✓</text>
+      <text x="90" y="1122" fill="#dc2626">· admin_manage_agent（revoke/purge 破坏性）—— 主动跳过，不对真实身份执行</text>
+    </g>
+  </g>
+
+  <!-- ═══════════ 阶段 6：收尾 ═══════════ -->
+  <text x="590" y="1164" text-anchor="middle" font-size="13" font-weight="700" fill="#94a3b8">── 阶段 6 · 收尾 ──</text>
+
+  <g>
+    <rect x="60" y="1178" width="300" height="86" rx="10" fill="#ffffff" stroke="#3b82f6" stroke-width="1.5"/>
+    <text x="210" y="1202" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">⑨ rotate_token 换新</text>
+    <text x="210" y="1221" text-anchor="middle" font-size="11" fill="#334155">旧 token 立即失效</text>
+    <text x="210" y="1239" text-anchor="middle" font-size="11" fill="#334155">新 token 覆盖写回本地文件</text>
+    <text x="210" y="1256" text-anchor="middle" font-size="11" fill="#16a34a" font-weight="600">✓ 新 token open_session 验证通过</text>
+  </g>
+
+  <line x1="360" y1="1220" x2="470" y2="1220" stroke="#16a34a" stroke-width="2" marker-end="url(#arrGreen)"/>
+  <text x="415" y="1211" text-anchor="middle" font-size="10" fill="#16a34a">测试收官通知</text>
+
+  <g>
+    <rect x="470" y="1178" width="270" height="86" rx="10" fill="#ffffff" stroke="#22c55e" stroke-width="1.5"/>
+    <text x="605" y="1202" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">⑩ tiger 最终确认</text>
+    <text x="605" y="1221" text-anchor="middle" font-size="11" fill="#334155">双向全链路验证通过</text>
+    <text x="605" y="1239" text-anchor="middle" font-size="11" fill="#334155">cat 通知 berth 已清理</text>
+    <text x="605" y="1256" text-anchor="middle" font-size="11" fill="#16a34a" font-weight="600">✓ E2E 正式收官</text>
+  </g>
+
+  <!-- 成果横幅 -->
+  <rect x="60" y="1290" width="700" height="118" rx="12" fill="#16a34a"/>
+  <text x="410" y="1322" text-anchor="middle" font-size="17" font-weight="700" fill="#ffffff">测试结果：29/30 工具实测通过</text>
+  <text x="410" y="1348" text-anchor="middle" font-size="12" fill="#dcfce7">私信收发 · 已读 · ack · 任务双向状态机 · 取消 · 契约全链路 · admin 通道</text>
+  <text x="410" y="1372" text-anchor="middle" font-size="12" fill="#dcfce7">唯一未执行：admin_manage_agent（破坏性操作，保护真实身份主动跳过）</text>
+  <text x="410" y="1394" text-anchor="middle" font-size="11" fill="#bbf7d0">测试痕迹已清理：测试 berth 删除 · 双方收件箱归零</text>
+
+  <!-- 发现问题 -->
+  <rect x="790" y="1290" width="360" height="118" rx="12" fill="#ffffff" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="815" y="1316" font-size="13" font-weight="700" fill="#854d0e">实测发现 → 已修复（4 项）</text>
+  <g font-size="10.5" fill="#334155">
+    <text x="815" y="1338">① 漏 token 只报 required property → 友好指引</text>
+    <text x="815" y="1356">② 自己的任务回执刷屏对话流 → kind 过滤</text>
+    <text x="815" y="1374">③ 审计无法按任务查 → get_audit_log 加 task_id</text>
+    <text x="815" y="1392">④ 事件名无校验产生脏数据 → 名字规范校验</text>
+  </g>
+
+  <!-- 底部说明 -->
+  <text x="590" y="1445" text-anchor="middle" font-size="12" fill="#94a3b8">图例：</text>
+  <line x1="640" y1="1441" x2="680" y2="1441" stroke="#2563eb" stroke-width="2" marker-end="url(#arrBlue)"/>
+  <text x="688" y="1445" font-size="11" fill="#64748b">cat → tiger</text>
+  <line x1="770" y1="1441" x2="810" y2="1441" stroke="#16a34a" stroke-width="2" marker-end="url(#arrGreen)"/>
+  <text x="818" y="1445" font-size="11" fill="#64748b">tiger → cat / 收官</text>
+  <text x="590" y="1475" text-anchor="middle" font-size="11" fill="#cbd5e1">MCP Harbor E2E · 2026-09-13 · 同一 correlation_id=e2e-20260913 串联全部消息与任务</text>
+</svg>
