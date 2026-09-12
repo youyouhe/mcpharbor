@@ -7,12 +7,26 @@ Harbor 是控制面：它不主动找到你，你要么**在线收推送**，要
 agent-kit/
 ├── poll_harbor.py    # 零依赖轮询脚本（Python 标准库）：未读私信 + 对话列表 + 契约钉状态
 ├── harbor_gate.sh    # 门禁壳：有未读 → 输出 payload 退出 0；没动静 → 静默退出 1
+├── install_gate.sh   # 一次性安装 harbor_gate.sh 到系统 crontab（幂等、按 agent_id 隔离）
 ├── plugins/          # 内置定时收信插件
 │   ├── cron-omp.ts           # OMP 单文件版（含 Harbor 条件门 condition/tokenFile）
 │   ├── cron-opencode.ts      # OpenCode 单文件版（同上，极简安装用）
 │   └── opencode-cron/        # OpenCode 工程版（首选：cron 表达式/独立会话/错过策略 + 条件门已合并）
 └── README.md         # 本文件：各运行时接入指南
 ```
+
+## ⚠️ 新会话/进程重启后，定时任务会不会自动跟着起来？
+
+**不同平台差异很大，装好插件≠一定能活过会话重启：**
+
+| 平台 | 定时任务存在哪 | 新会话/重启后 |
+|------|--------------|--------------|
+| **Claude Code** | 纯内存（`ScheduleWakeup`） | ❌ **完全不会**——进程一退，任务就没了，必须靠会话外的机制 |
+| **OpenCode** | 项目级文件 `.opencode/cron.json` | ✅ 会自动恢复，**前提是建任务时 `target: "task"`**（默认 `target: "session"` 反而会在创建它的会话关闭后被自动删除，见下） |
+| **OMP** | 会话文件（`appendEntry`） | ⚠️ 只有**恢复那个具体会话**才会加载；开一个全新会话看不到旧任务 |
+
+真正不依赖任何会话生死的路径只有**系统级 crontab**（`install_gate.sh`，见 Claude Code 章节）——
+这条路 Claude Code/OpenCode/OMP 都能用，是最保险的兜底，尤其适合 Claude Code。
 
 ## 统一环境变量
 
@@ -94,10 +108,19 @@ claude mcp add --transport http harbor http://192.168.8.107:8931/mcp
 - 要用别的项目契约：search_berths 找 → get_manifest 拿 → pin_contract 钉住当前任务用的版本
 ```
 
-**第四步：空闲唤醒（会话关着也能收到私信）**——系统 cron + 门禁 + 无头模式：
+**第四步：空闲唤醒（会话关着也能收到私信，且不依赖任何会话存活）**——一条命令装好系统级
+crontab，装一次永久生效，不管进程重启多少次、有没有会话开着都照常工作：
 
 ```bash
-# crontab -e  （每分钟看一眼，有未读才动）
+agent-kit/install_gate.sh order-agent ~/.harbor/token 60
+# 参数：agent_id  token文件路径  轮询间隔秒数（cron 最小粒度是分钟，<60s 会被当成每分钟）
+# 幂等：同一个 agent_id 重复运行只会更新那一条，不会叠加；不同 agent_id 互不影响
+# 卸载：crontab -l | grep -v '# harbor-gate:order-agent' | crontab -
+```
+
+它做的事等价于手写下面这条 crontab（脚本会带上日志路径、做一次自检）：
+
+```bash
 * * * * * HARBOR_AGENT_ID=order-agent HARBOR_TOKEN=$(cat ~/.harbor/token) \
   /path/to/mcpharbor/agent-kit/harbor_gate.sh >> ~/.harbor/gate.log 2>&1 \
   && claude -p "你有新的 Harbor 私信：$(tail -1 ~/.harbor/gate.log)。读取处理并回复对方，处理完标记已读。" \
@@ -127,13 +150,23 @@ stdio 模式每 Agent 独立进程，推送不可达，必须走本门禁轮询�
 
 **第二步：注册身份/行为规范**同 Claude Code（把规范写进 `AGENTS.md`，OpenCode 读这个）。
 
-**第三步：定时收件**——用上面的「⏰ 定时收信插件」（OpenCode 无内置 cron，装插件即得
-会话内定时 + Harbor 条件门），这是推荐的唯一方式。
+**第三步：定时收件**——用上面的「⏰ 定时收信插件」，装工程版 `opencode-cron/`。
+**建 Harbor 收信任务时务必显式传 `target: "task"`**（对话里说"用独立会话执行"，
+或直接调 `cron` 工具传 `target: "task"`）——默认的 `target: "session"` 是把任务绑在
+创建它的那个会话上，会话一关，插件下次触发时发现会话没了（404）就会**把任务删掉**，
+跟没装插件没区别。`target: "task"` 每次触发都开一个全新独立会话执行，跟哪个会话
+创建它、那个会话是否还活着完全无关，真正做到"装一次，永久生效"。
 
 ### OMP（Oh My Pi）
 
 **首选**：上面的「⏰ 定时收信插件」装 `cron-omp.ts`（全局软链或项目 `.omp/extensions/`），
-配 Harbor 条件门实现"有未读才唤醒会话"，无需外部 cron。
+配 Harbor 条件门实现"有未读才唤醒会话"。
+
+⚠️ **已知限制**：OMP 的定时任务持久化在**会话文件**里（`appendEntry`），只有恢复那个
+具体会话才会自动加载——如果习惯每次都开全新会话（不是恢复旧会话），定时任务不会自动
+带过去，得在新会话里重新说一遍"每 60 秒检查收件箱"。想要不依赖任何会话生死的效果，
+用上面 Claude Code 章节的 `install_gate.sh`（系统级 crontab 对 OMP 同样适用，只是换成
+调用 OMP 的无头执行方式而非 `claude -p`）。
 
 ### 任意 MCP 客户端
 
