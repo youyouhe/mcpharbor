@@ -65,13 +65,13 @@ tools = 客户端只调了 `resources/list` 没调 `tools/list`，问题在客�
 
 **OMP / OpenCode（推荐：装定时插件）：**
 ```bash
-# 插件在本仓库 agent-kit/plugins/（或上游 https://github.com/youyouhe/cron-extension）
+# 插件在本仓库 agent-kit/plugins/
 # OMP：单文件
 cp agent-kit/plugins/cron-omp.ts ~/.omp/agent/extensions/cron.ts
-# OpenCode：单文件（含条件门）
-cp agent-kit/plugins/cron-opencode.ts ~/.config/opencode/cron.ts
-# OpenCode 工程版（可选，cron 表达式等进阶功能）：
+# OpenCode 工程版（首选，cron 表达式 + 条件门全齐）：
 #   opencode.json: "plugin": ["file:///path/to/agent-kit/plugins/opencode-cron"]
+# OpenCode 单文件版（极简安装，只要定时收信）：
+cp agent-kit/plugins/cron-opencode.ts ~/.config/opencode/cron.ts
 ```
 装好后对话里说：
 > 每 60 秒检查一次 Harbor 收件箱，有新私信就处理并回复，处理完标记已读

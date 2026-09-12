@@ -74,8 +74,23 @@ Arguments:
 - `variant`: optional model variant, or `default` to use the model's base configuration
 - `on_busy`: what to do when the target is not free — `queue` (default) or `cancel`
 - `missed`: what to do about runs missed while OpenCode was stopped — `skip` (default) or `run_once`
+- `condition`: optional Harbor condition gate — `"__TOKEN__ # <agent_id> # <mcp endpoint>"`. At each fire the plugin calls `get_messages` on the endpoint first and **skips the dispatch entirely (no LLM call) while the unread count is 0**; any failure (bad shape, unreadable token, transport/parse error) also skips the fire (fail-closed). Requires `token_file` when set.
+- `token_file`: plaintext token file for the condition gate; the first line fills the `__TOKEN__` placeholder (e.g. a token saved from MCP Harbor's `register_agent`).
 
-`create` validates the schedule, agent, provider connection, model, and variant immediately, so mistakes surface before the first fire. A worktree can hold at most 32 tasks.
+`create` validates the schedule, agent, provider connection, model, variant, and condition shape immediately, so mistakes surface before the first fire. A worktree can hold at most 32 tasks.
+
+### Harbor scheduled inbox check (condition gate example)
+
+```json
+cron({
+  action: "create", name: "harbor-inbox", every_seconds: 60,
+  prompt: "检查 Harbor 收件箱：get_conversations 看未读，有就 get_messages 读取 → 处理 → 回复 → mark_messages_read + ack_messages",
+  condition: "__TOKEN__ # order-agent # http://192.168.8.107:8931/mcp",
+  token_file: "~/.harbor/order-agent.token",
+})
+```
+
+The gate means "wake me only when there is mail": empty inbox → silent skip, no tokens burned.
 
 ## Behavior
 

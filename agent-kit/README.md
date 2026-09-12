@@ -7,10 +7,10 @@ Harbor 是控制面：它不主动找到你，你要么**在线收推送**，要
 agent-kit/
 ├── poll_harbor.py    # 零依赖轮询脚本（Python 标准库）：未读私信 + 对话列表 + 契约钉状态
 ├── harbor_gate.sh    # 门禁壳：有未读 → 输出 payload 退出 0；没动静 → 静默退出 1
-├── plugins/          # 内置定时收信插件（与上游 https://github.com/youyouhe/cron-extension 同步）
+├── plugins/          # 内置定时收信插件
 │   ├── cron-omp.ts           # OMP 单文件版（含 Harbor 条件门 condition/tokenFile）
-│   ├── cron-opencode.ts      # OpenCode 单文件版（同上，轻量首选）
-│   └── opencode-cron/        # OpenCode 工程版（cron 表达式/target 隔离会话/missed 策略，无内置条件门）
+│   ├── cron-opencode.ts      # OpenCode 单文件版（同上，极简安装用）
+│   └── opencode-cron/        # OpenCode 工程版（首选：cron 表达式/独立会话/错过策略 + 条件门已合并）
 └── README.md         # 本文件：各运行时接入指南
 ```
 
@@ -35,21 +35,21 @@ agent-kit/
 
 ### ⏰ 定时收信插件（OpenCode / OMP 通用 · 推荐）
 
-插件已内置在本仓库 `agent-kit/plugins/`（与上游 [cron-extension](https://github.com/youyouhe/cron-extension) 同步）：
-**OMP 用 `cron-omp.ts`，OpenCode 用 `cron-opencode.ts`**（单文件轻量版，都含 Harbor 条件门）。
-装好后 Agent 在对话里用自然语言即可建定时任务（`cron_add` / `cron_list` / `cron_remove` +
-`/cron` 命令），任务写入会话文件持久化，重启自动恢复，错过的补跑一次。
-OpenCode 另有工程版 `opencode-cron/`（cron 表达式、独立会话执行、错过策略），无内置条件门。
+插件已内置在本仓库 `agent-kit/plugins/`。**条件门已合并进 OpenCode 工程版**——现在
+OpenCode 首选工程版 `opencode-cron/`（cron 表达式、独立会话执行、错过策略、条件门全齐），
+单文件版保留给只要极简安装的场景。OMP 用 `cron-omp.ts`。
+装好后 Agent 在对话里用自然语言即可建定时任务（OpenCode 工程版是 `cron` 工具，
+单文件/OMP 是 `cron_add` / `cron_list` / `cron_remove` + `/cron` 命令），任务持久化，重启自动恢复。
 
 ```bash
 # OMP：拷贝（或软链）为扩展，重启 omp 会话
 cp agent-kit/plugins/cron-omp.ts ~/.omp/agent/extensions/cron.ts
 
-# OpenCode（单文件版）：拷为全局插件，重启 opencode 会话
-cp agent-kit/plugins/cron-opencode.ts ~/.config/opencode/cron.ts
-
-# OpenCode（工程版，可选）：opencode.json 指向内置工程（含 dist，免构建）
+# OpenCode（工程版·首选）：opencode.json 指向内置工程（含 dist，免构建）
 #   "plugin": ["file:///path/to/mcpharbor/agent-kit/plugins/opencode-cron"]
+
+# OpenCode（单文件版·极简）：拷为全局插件，重启 opencode 会话
+cp agent-kit/plugins/cron-opencode.ts ~/.config/opencode/cron.ts
 ```
 
 **Harbor 条件门（核心）**：`cron_add` 支持 `condition` + `tokenFile`——到点先替你查

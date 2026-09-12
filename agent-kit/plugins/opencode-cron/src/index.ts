@@ -45,6 +45,12 @@ export const JobSchema = z.object({
   variant: z.string().optional(),
   onBusy: z.enum(["queue", "cancel"]).optional(), // default queue
   missed: z.enum(["skip", "run_once"]).optional(), // default skip
+  // Harbor condition gate: at fire time, call get_messages first and only
+  // dispatch when unread count > 0 (saves LLM calls when the inbox is empty).
+  // condition shape: "__TOKEN__ # <agent_id> # <mcp endpoint>"; tokenFile's
+  // first line fills the __TOKEN__ placeholder.
+  condition: z.string().optional(),
+  tokenFile: z.string().optional(),
   enabled: z.boolean(),
   createdAt: z.string(),
   nextAt: z.number().optional(), // epoch ms of the armed occurrence (missed-run detection)
@@ -221,6 +227,95 @@ function parseScheduleInput(input: ScheduleInput): Partial<Job> {
 }
 
 type CronTool = ReturnType<typeof tool>
+
+// ── Harbor condition gate ──
+// Mirrors the single-file cron-opencode.ts semantics: unread count from a
+// streamable-http MCP endpoint decides whether the fire dispatches at all.
+// Every failure mode (bad condition shape, unreadable token, transport or
+// parse errors) fails closed: skip the fire, keep the schedule.
+
+type FetchLike = (url: string, init?: RequestInit) => Promise<Response>
+
+export function parseCondition(spec: string): { agentId: string; endpoint: string; tokenPlaceholder: string } {
+  const parts = spec.split(" # ").map((p) => p.trim())
+  const [tokenPlaceholder, agentId, endpoint] = parts
+  if (parts.length !== 3 || !tokenPlaceholder || !agentId || !endpoint) {
+    throw new Error('condition must be "__TOKEN__ # <agent_id> # <endpoint>"')
+  }
+  return { agentId, endpoint, tokenPlaceholder }
+}
+
+async function harborUnreadCount(fetchImpl: FetchLike, endpoint: string, agentId: string, token: string): Promise<number> {
+  const headers = { "Content-Type": "application/json", Accept: "application/json, text/event-stream" }
+  const init = await fetchImpl(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "opencode-cron", version: "1" } },
+    }),
+  })
+  const sessionId = init.headers.get("mcp-session-id") ?? ""
+  if (!sessionId) throw new Error("initialize did not return mcp-session-id")
+  await fetchImpl(endpoint, {
+    method: "POST",
+    headers: { ...headers, "mcp-session-id": sessionId },
+    body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+  })
+  const call = await fetchImpl(endpoint, {
+    method: "POST",
+    headers: { ...headers, "mcp-session-id": sessionId },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "get_messages", arguments: { agent_id: agentId, token, unread_only: true, limit: 20 } },
+    }),
+  })
+  // The endpoint answers SSE-style; take the last data: line's JSON.
+  const body = await call.text()
+  const dataLines = body.split("\n").filter((line) => line.startsWith("data:"))
+  const lastData = dataLines[dataLines.length - 1]
+  if (!lastData) throw new Error("tools/call returned no data line")
+  const payload = JSON.parse(lastData.slice(5).trim()) as {
+    result?: { content?: Array<{ text?: string }> }
+  }
+  const text = (payload.result?.content ?? []).map((part) => part.text ?? "").join("")
+  const count = Number(JSON.parse(text).count)
+  if (!Number.isFinite(count)) throw new Error("get_messages returned a non-numeric count")
+  return count
+}
+
+export async function conditionGate(
+  job: Pick<Job, "condition" | "tokenFile">,
+  readFileImpl: (file: string) => Promise<string> = (file) => readFile(file, "utf8"),
+  fetchImpl: FetchLike = (url, init) => fetch(url, init),
+): Promise<{ go: boolean; detail?: string }> {
+  const spec = (job.condition ?? "").trim()
+  if (!spec) return { go: true } // No condition: previous behavior, dispatch unconditionally.
+  let agentId: string
+  let endpoint: string
+  try {
+    ;({ agentId, endpoint } = parseCondition(spec))
+  } catch (error) {
+    return { go: false, detail: error instanceof Error ? error.message : String(error) }
+  }
+  let token = ""
+  try {
+    token = ((await readFileImpl(job.tokenFile ?? "")) ?? "").split(/\r?\n/)[0]?.trim() ?? ""
+  } catch (error) {
+    return { go: false, detail: `read token file failed: ${error instanceof Error ? error.message : String(error)}` }
+  }
+  if (!token) return { go: false, detail: "token file is empty" }
+  try {
+    const count = await harborUnreadCount(fetchImpl, endpoint, agentId, token)
+    return count > 0 ? { go: true, detail: `unread=${count}` } : { go: false, detail: "unread=0" }
+  } catch (error) {
+    return { go: false, detail: `gate failed: ${error instanceof Error ? error.message : String(error)}` }
+  }
+}
 
 export async function createCron(
   client: Client,
@@ -477,7 +572,13 @@ export async function createCron(
       clearTimer(current.name)
       await persist()
     }
-    await dispatch(current)
+    const gate = await conditionGate(current)
+    if (!gate.go) {
+      // Fail-closed: no dispatch, no LLM call; the schedule keeps ticking.
+      console.log(`[opencode-cron] task "${current.name}" condition not met (${gate.detail ?? ""}); skipped`)
+    } else {
+      await dispatch(current)
+    }
     const again = jobs.get(current.name)
     if (again?.enabled && !disposed) {
       scheduleJob(again, { persist: false })
@@ -499,7 +600,7 @@ export async function createCron(
 
   const cronTool = tool({
     description:
-      "Manage scheduled tasks. A task runs a prompt either by injecting it into the session it was created in (target session, default; idle sessions start a new turn, busy sessions follow on_busy) or in a fresh standalone session (target task). Schedule is exactly one of: 5-field cron expression (schedule, server local time), every_seconds, daily_at (\"HH:MM\" local), once_in_seconds. OpenCode must be running at the trigger time. Use the list action to see existing tasks, their next run time, and last run status.",
+      "Manage scheduled tasks. A task runs a prompt either by injecting it into the session it was created in (target session, default; idle sessions start a new turn, busy sessions follow on_busy) or in a fresh standalone session (target task). Schedule is exactly one of: 5-field cron expression (schedule, server local time), every_seconds, daily_at (\"HH:MM\" local), once_in_seconds. Optional Harbor condition gate: condition \"__TOKEN__ # <agent_id> # <mcp endpoint>\" plus token_file (first line = token) checks get_messages first and skips the fire while the inbox is empty — no LLM call, no wasted tokens. OpenCode must be running at the trigger time. Use the list action to see existing tasks, their next run time, and last run status.",
     args: {
       action: tool.schema.enum(["list", "create", "update", "remove", "enable", "disable", "run"]),
       name: tool.schema.string().min(1).optional(),
@@ -514,6 +615,8 @@ export async function createCron(
       variant: tool.schema.string().min(1).optional(),
       on_busy: tool.schema.enum(["queue", "cancel"]).optional(),
       missed: tool.schema.enum(["skip", "run_once"]).optional(),
+      condition: tool.schema.string().optional(),
+      token_file: tool.schema.string().optional(),
     },
     async execute(input, context) {
       switch (input.action) {
@@ -532,6 +635,11 @@ export async function createCron(
           if (jobs.has(name)) throw new Error(`A task named "${name}" already exists`)
           const schedule = parseScheduleInput(input)
           await validateJobFields({ ...input, prompt })
+          if (input.condition !== undefined && input.condition.trim() !== "") {
+            // Shape-check now so mistakes surface before the first fire.
+            parseCondition(input.condition)
+            if (!input.token_file) throw new Error("token_file is required when condition is set")
+          }
           const job: Job = {
             name,
             prompt,
@@ -543,6 +651,8 @@ export async function createCron(
             variant: normalizeVariant(input.variant),
             onBusy: input.on_busy ?? "queue",
             missed: input.missed ?? "skip",
+            condition: input.condition?.trim() || undefined,
+            tokenFile: input.token_file?.trim() || undefined,
             enabled: true,
             createdAt: io.now().toISOString(),
           }
@@ -576,6 +686,16 @@ export async function createCron(
           if (input.on_busy !== undefined) job.onBusy = input.on_busy
           if (input.missed !== undefined) job.missed = input.missed
           if (input.target !== undefined) job.target = input.target
+          if (input.condition !== undefined) {
+            if (input.condition.trim() !== "") {
+              parseCondition(input.condition)
+              if (input.token_file === undefined && !job.tokenFile) {
+                throw new Error("token_file is required when condition is set")
+              }
+            }
+            job.condition = input.condition.trim() || undefined
+          }
+          if (input.token_file !== undefined) job.tokenFile = input.token_file.trim() || undefined
           scheduleJob(job, { persist: false })
           await persist()
           return JSON.stringify({ updated: jobSummary(job) }, null, 2)
