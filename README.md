@@ -17,7 +17,15 @@ python -m mcpharbor.server
 # 多个 agent 共享同一个 Harbor 进程，MCP 原生通知推送才生效
 # 同时设置 MCPHARBOR_ADMIN_TOKEN 才能使用 admin 面板 / get_notifications / get_audit_log
 MCPHARBOR_TRANSPORT=streamable-http MCPHARBOR_ADMIN_TOKEN=<自己定的密钥> mcpharbor
+
+# 长期运行推荐用启停脚本（streamable-http 模式，监听 0.0.0.0:8931，日志 /tmp/mcpharbor_server.log）
+./harbor.sh start | stop | restart | status
 ```
+
+启停脚本说明：
+- admin token 从 `~/.harbor/admin.token` 读取（chmod 600），也可用环境变量 `MCPHARBOR_ADMIN_TOKEN` 覆盖；
+  端口/地址可用 `FASTMCP_PORT` / `FASTMCP_HOST` 覆盖（默认 `8931` / `0.0.0.0`，fastmcp 默认 8000）。
+- 数据在 `harbor.db`（SQLite），重启不丢已注册的 agent / berth / 订阅。
 
 ## Agent 侧接入
 
