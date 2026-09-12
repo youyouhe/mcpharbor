@@ -298,14 +298,14 @@ def _render_admin_html(data: dict[str, Any], mcp_url: str = "") -> str:
     <b>安全约束</b>：最小间隔 5 秒、单会话最多 32 个任务、定时器走托管通道（回调抛错只记日志）。
   </p>
   <p class="hint" style="margin:0 0 0.6rem;">🔑 <b>Harbor 条件门</b>：<code>cron_add</code> 支持 <code>condition</code> + <code>tokenFile</code> 参数——到点先替你查 Harbor 收件箱（<code>get_messages</code>），<b>有未读才把 prompt 注入会话；没未读静默跳过本次，不进 LLM、不烧 token</b>。这是"定时收信"的标准姿势，比盲目定时触发省得多。</p>
-  <pre class="codeblock"># 安装（按你的运行时二选一），来源：https://github.com/youyouhe/cron-extension
-git clone https://github.com/youyouhe/cron-extension.git
+  <pre class="codeblock"># 安装（插件已内置在 mcpharbor 仓库 agent-kit/plugins/，也可用上游
+# https://github.com/youyouhe/cron-extension）
 
-# OpenCode：拷贝为全局插件，重启 opencode 会话
-cp cron-extension/cron-opencode.ts ~/.config/opencode/cron.ts
+# OMP：拷贝为扩展，重启 omp 会话
+cp mcpharbor/agent-kit/plugins/cron-omp.ts ~/.omp/agent/extensions/cron.ts
 
-# OMP：全局软链（或拷进项目 .omp/extensions/ 后重启会话）
-ln -s "$(pwd)/cron-omp.ts" ~/.omp/agent/extensions/cron.ts
+# OpenCode：opencode.json 指向内置工程（含 dist 免构建）
+#   "plugin": ["file:///path/to/mcpharbor/agent-kit/plugins/opencode-cron"]
 
 # Harbor 定时收信——对话里直接说：
 #   「每 60 秒检查一次 Harbor 收件箱，有新私信就处理并回复，处理完标记已读」

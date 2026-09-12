@@ -21,8 +21,14 @@ MCPHARBOR_TRANSPORT=streamable-http MCPHARBOR_ADMIN_TOKEN=<自己定的密钥> m
 
 ## Agent 侧接入
 
-见 [agent-kit/](agent-kit/)：零依赖轮询脚本（`poll_harbor.py`）、空闲会话唤醒门禁
-（`harbor_gate.sh`）、各运行时（Claude Code / OpenCode / OMP）的定时接入指南。
+两种途径：
+
+1. **Skill（推荐给 Agent 用户）**：把 [skills/harbor-onboard/](skills/harbor-onboard/) 拷进你
+   Agent 项目的 `.claude/skills/`（Claude Code）或让 Agent 直接读该 SKILL.md——它会引导完成
+   配置 MCP → 注册身份存 token → 写协作规范 → 装定时收信 → 端到端验证。
+2. **手工接入**：见 [agent-kit/](agent-kit/)——零依赖轮询脚本（`poll_harbor.py`）、空闲会话
+   唤醒门禁（`harbor_gate.sh`）、内置定时收信插件（`plugins/`，OpenCode / OMP 通用，支持
+   Harbor 条件门）、各运行时接入指南。
 
 
 ## MCP 工具
