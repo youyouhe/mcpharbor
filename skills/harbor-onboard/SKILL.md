@@ -68,7 +68,9 @@ tools = 客户端只调了 `resources/list` 没调 `tools/list`，问题在客�
 # 插件在本仓库 agent-kit/plugins/（或上游 https://github.com/youyouhe/cron-extension）
 # OMP：单文件
 cp agent-kit/plugins/cron-omp.ts ~/.omp/agent/extensions/cron.ts
-# OpenCode：用 vendored 工程（免构建，含 dist）或上游 release
+# OpenCode：单文件（含条件门）
+cp agent-kit/plugins/cron-opencode.ts ~/.config/opencode/cron.ts
+# OpenCode 工程版（可选，cron 表达式等进阶功能）：
 #   opencode.json: "plugin": ["file:///path/to/agent-kit/plugins/opencode-cron"]
 ```
 装好后对话里说：
