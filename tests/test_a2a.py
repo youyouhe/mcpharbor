@@ -505,8 +505,10 @@ def test_task_state_machine():
     # 每次转移都给对方发了通知
     conv = json.loads(server.get_conversations.fn(agent_id="boss", token=boss))
     assert conv["count"] == 1  # 只有 worker 一个对话对象
-    assert conv["conversations"][0]["total"] >= 6
-    print("✓ 状态变化全程通知交办方（收件箱可追溯）")
+    # 新语义：boss 自己发出的状态回执（from_agent=boss 的 task_event）不再占他的对话流；
+    # 对方（worker）发来的状态通知仍完整可追溯
+    assert conv["conversations"][0]["total"] >= 3
+    print("✓ 状态变化全程通知交办方（对方发来的通知收件箱可追溯，自己的回执不再刷屏）")
 
     # 取消：新任务由交办方取消；受托方不能取消
     r = _task("create_task", creator="boss", token=boss, assignee="worker", title="取消试验")

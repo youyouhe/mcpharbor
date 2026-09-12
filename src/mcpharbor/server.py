@@ -146,6 +146,11 @@ def _check_recipient(store: HarborStorage, agent_id: str) -> str | None:
 
 def _check_auth(agent_id: str, token: str) -> str | None:
     """校验 agent_id 与 token 是否匹配。返回错误信息，通过则返回 None。"""
+    if not token:
+        # 工具签名的 token 都带默认值（= ""），漏传会落到这里而不是卡在 schema 校验，
+        # 报错要告诉调用方下一步怎么做，而不是甩一句 "required property"。
+        return ("token 未提供：Harbor 的写操作都要求身份认证——先调用 register_agent 注册身份"
+                "（token 只在注册时返回一次，请立即保存到文件），之后所有调用都带上它")
     store = _get_store()
     existing = store.get_agent_token(agent_id)
     if existing is None:
@@ -161,8 +166,27 @@ def _check_admin(admin_token: str) -> str | None:
     expected = os.environ.get("MCPHARBOR_ADMIN_TOKEN", "")
     if not expected:
         return "admin 功能未启用：请在启动 Harbor 前设置环境变量 MCPHARBOR_ADMIN_TOKEN"
-    if not admin_token or not secrets.compare_digest(admin_token, expected):
+    if not admin_token:
+        return "admin_token 未提供：admin 查询/管理类操作需要 MCPHARBOR_ADMIN_TOKEN"
+    if not secrets.compare_digest(admin_token, expected):
         return "admin_token 无效"
+    return None
+
+
+# 事件名：小写字母/数字开头结尾，中间允许点/连字符/下划线（如 user.created、e2e.ping）。
+# 不校验的话 notify/subscribe 随手填的字符串会进通知历史，订阅方按 event 匹配就乱套了。
+_EVENT_NAME_RE = re.compile(r"[a-z0-9]([a-z0-9._\-]*[a-z0-9])?")
+
+
+def _validate_event_names(events: list[str], allow_wildcard: bool = False) -> str | None:
+    """校验事件名列表。返回错误信息，全部合法返回 None。"""
+    for e in events:
+        if allow_wildcard and e == "*":
+            continue
+        if not e or len(e) > 64 or not _EVENT_NAME_RE.fullmatch(e):
+            return (f"事件名 {e!r} 不合法：只能用小写字母/数字/点/连字符/下划线，"
+                    f"字母或数字开头结尾，长度 ≤64（如 user.created、e2e.ping"
+                    + ("、* 通配全部事件）" if allow_wildcard else "）"))
     return None
 
 
@@ -661,7 +685,7 @@ def register_agent(
 
 
 @mcp.tool()
-def rotate_token(agent_id: str, current_token: str) -> str:
+def rotate_token(agent_id: str, current_token: str = "") -> str:
     """使用现有 token 为 agent_id 更换新 token，旧 token 立即失效。"""
     store = _get_store()
     err = _check_auth(agent_id, current_token)
@@ -685,7 +709,7 @@ async def publish_manifest(
     berth: str,
     version: str,
     owner: str,
-    token: str,
+    token: str = "",
     capabilities: list[str] | None = None,
     protocol: str = "http",
     base_url: str = "",
@@ -707,6 +731,10 @@ async def publish_manifest(
     if auth_err:
         _audit("auth.denied", owner, f"berth:{berth}", {"reason": auth_err})
         return json.dumps({"error": auth_err}, ensure_ascii=False)
+
+    events_err = _validate_event_names(events or [])
+    if events_err:
+        return json.dumps({"error": f"events 校验失败：{events_err}"}, ensure_ascii=False)
 
     # 先做完全部校验再落库：errors 的 key 必须是数字错误码，不然半途抛异常会
     # 留下"berth 已经指向新版本号、但 manifest 数据从未写入"的脏状态。
@@ -812,8 +840,8 @@ def search_berths(
 @mcp.tool()
 def subscribe(
     subscriber: str,
-    token: str,
-    berth: str,
+    token: str = "",
+    berth: str = "",
     events: list[str] | None = None,
     version_range: str = "*",
     callback: str = "",
@@ -835,6 +863,10 @@ def subscribe(
     if auth_err:
         _audit("auth.denied", subscriber, f"berth:{berth}", {"reason": auth_err})
         return json.dumps({"error": auth_err}, ensure_ascii=False)
+
+    events_err = _validate_event_names(events or [], allow_wildcard=True)
+    if events_err:
+        return json.dumps({"error": f"events 校验失败：{events_err}"}, ensure_ascii=False)
 
     berth_obj = store.get_berth(berth)
     if berth_obj is None:
@@ -862,7 +894,7 @@ def subscribe(
 
 
 @mcp.tool()
-def open_session(agent_id: str, token: str, ctx: Context | None = None) -> str:
+def open_session(agent_id: str, token: str = "", ctx: Context | None = None) -> str:
     """在不订阅任何 berth 的情况下，把当前连接注册为 agent_id 的存活会话。
 
     仅用于希望接收 harbor.send_message 私信原生推送、但不关心 berth 契约变更的场景。
@@ -884,8 +916,8 @@ def open_session(agent_id: str, token: str, ctx: Context | None = None) -> str:
 @mcp.tool()
 async def send_message(
     from_agent: str,
-    token: str,
-    message: str,
+    token: str = "",
+    message: str = "",
     to_agent: str = "",
     to_agents: list[str] | None = None,
     berth: str = "",
@@ -972,12 +1004,13 @@ async def send_message(
 @mcp.tool()
 def get_messages(
     agent_id: str,
-    token: str,
+    token: str = "",
     with_agent: str = "",
     unread_only: bool = False,
     limit: int = 50,
 ) -> str:
-    """查询自己的私信（作为收件人或发件人），需要自己的 token——第三方无法查看。"""
+    """查询自己的私信（作为收件人或发件人），需要自己的 token——第三方无法查看。
+    默认不返回"自己发出的任务事件通知"（状态转移回执自己全知道，不占收件箱）。"""
     store = _get_store()
 
     auth_err = _check_auth(agent_id, token)
@@ -985,7 +1018,8 @@ def get_messages(
         return json.dumps({"error": auth_err}, ensure_ascii=False)
 
     msgs = store.get_messages(agent_id, with_agent=with_agent or None,
-                              unread_only=unread_only, limit=limit)
+                              unread_only=unread_only, limit=limit,
+                              hide_own_task_events=True)
     return json.dumps({
         "messages": [m.model_dump(mode="json") for m in msgs],
         "count": len(msgs),
@@ -993,9 +1027,10 @@ def get_messages(
 
 
 @mcp.tool()
-def mark_messages_read(agent_id: str, token: str, message_ids: list[str]) -> str:
+def mark_messages_read(agent_id: str, token: str = "", message_ids: list[str] | None = None) -> str:
     """把发给自己的私信标记为已读，方便下次只拉取新消息（unread_only=True）。"""
     store = _get_store()
+    message_ids = message_ids or []
 
     auth_err = _check_auth(agent_id, token)
     if auth_err:
@@ -1008,7 +1043,7 @@ def mark_messages_read(agent_id: str, token: str, message_ids: list[str]) -> str
 
 
 @mcp.tool()
-def get_conversations(agent_id: str, token: str) -> str:
+def get_conversations(agent_id: str, token: str = "") -> str:
     """查看自己的对话列表：每个对话对象一条最新消息 + 未读数。
 
     多轮往来后不要翻平铺的历史消息——消费者应关注最新消息（它反映最新状态和结果）。
@@ -1062,7 +1097,7 @@ def search_agents(keyword: str = "", capability: str = "") -> str:
 
 
 @mcp.tool()
-async def admin_command(admin_token: str, to_agent: str, command: str, correlation_id: str = "") -> str:
+async def admin_command(admin_token: str = "", to_agent: str = "", command: str = "", correlation_id: str = "") -> str:
     """admin 直接向某个 agent 下一句指令，不做任务状态跟踪——发出去就完了。
 
     需要真正的 MCPHARBOR_ADMIN_TOKEN（不是随便一个 agent 自己的 token），这样收件人
@@ -1082,6 +1117,7 @@ async def admin_command(admin_token: str, to_agent: str, command: str, correlati
     msg = DirectMessage(
         from_agent="admin", to_agent=to_agent, message=command,
         correlation_id=correlation_id, severity=NotifyPriority.HIGH,
+        kind="admin_command",
     )
     store.add_message(msg)
     _audit("admin.command", "admin", f"agent:{to_agent}", {
@@ -1104,7 +1140,7 @@ async def admin_command(admin_token: str, to_agent: str, command: str, correlati
 
 
 @mcp.tool()
-def admin_manage_agent(admin_token: str, agent_id: str, action: str) -> str:
+def admin_manage_agent(admin_token: str = "", agent_id: str = "", action: str = "") -> str:
     """admin 清理废弃/异常的 agent 注册。action 二选一：
 
     - "revoke"：吊销——token 立即失效、踢下线，但注册记录保留可追溯（推荐先用这个）。
@@ -1160,7 +1196,7 @@ def admin_manage_agent(admin_token: str, agent_id: str, action: str) -> str:
 
 
 @mcp.tool()
-def admin_manage_berth(admin_token: str, berth: str, action: str) -> str:
+def admin_manage_berth(admin_token: str = "", berth: str = "", action: str = "") -> str:
     """admin 管理某个 Berth（项目卡）。action 三选一：
 
     - "deactivate"：下架——berth 从搜索/发现里消失（inactive），全部版本历史保留，可恢复。
@@ -1211,7 +1247,7 @@ def admin_manage_berth(admin_token: str, berth: str, action: str) -> str:
 
 @mcp.tool()
 def admin_cleanup(
-    admin_token: str,
+    admin_token: str = "",
     message_retention_days: int = 90,
     notification_retention_days: int = 90,
 ) -> str:
@@ -1251,7 +1287,7 @@ def admin_cleanup(
 async def notify(
     berth: str,
     event: str,
-    token: str,
+    token: str = "",
     message: str = "",
     correlation_id: str = "",
     actor: str = "",
@@ -1274,6 +1310,10 @@ async def notify(
         _audit("auth.denied", actor or "unknown", f"berth:{berth}", {"reason": auth_err})
         return json.dumps({"error": f"只有 berth={berth} 的 owner（{berth_obj.owner}）可以广播通知：{auth_err}"}, ensure_ascii=False)
     real_actor = berth_obj.owner
+
+    events_err = _validate_event_names([event])
+    if events_err:
+        return json.dumps({"error": f"event 校验失败：{events_err}"}, ensure_ascii=False)
 
     pri = NotifyPriority.NORMAL
     try:
@@ -1377,7 +1417,7 @@ def check_compat(
 
 
 @mcp.tool()
-def pin_contract(agent_id: str, token: str, berth: str, version: str, task_id: str = "") -> str:
+def pin_contract(agent_id: str, token: str = "", berth: str = "", version: str = "", task_id: str = "") -> str:
     """钉住某 berth 的契约版本："当前任务固定用这个版本"（contract pin）。
 
     任务进行到一半契约变了是协作的大敌——同一任务一半用旧契约、一半用新契约会出错。
@@ -1393,6 +1433,8 @@ def pin_contract(agent_id: str, token: str, berth: str, version: str, task_id: s
 
     if store.get_berth(berth) is None:
         return json.dumps({"error": f"berth={berth} 不存在"}, ensure_ascii=False)
+    if not version:
+        return json.dumps({"error": "version 必填：要钉住的具体版本号（用 get_manifest 可查最新版本）"}, ensure_ascii=False)
     if store.get_manifest(berth, version) is None:
         available = store.list_manifest_versions(berth)
         return json.dumps({
@@ -1410,7 +1452,7 @@ def pin_contract(agent_id: str, token: str, berth: str, version: str, task_id: s
 
 
 @mcp.tool()
-def unpin_contract(agent_id: str, token: str, berth: str, task_id: str = "") -> str:
+def unpin_contract(agent_id: str, token: str = "", berth: str = "", task_id: str = "") -> str:
     """解除契约钉（任务结束或已切换到新版本后调用）。"""
     store = _get_store()
 
@@ -1425,7 +1467,7 @@ def unpin_contract(agent_id: str, token: str, berth: str, task_id: str = "") -> 
 
 
 @mcp.tool()
-def get_my_pins(agent_id: str, token: str) -> str:
+def get_my_pins(agent_id: str, token: str = "") -> str:
     """查看自己钉住的全部契约版本，并标注哪些已落后于最新版。"""
     store = _get_store()
 
@@ -1466,7 +1508,7 @@ async def _notify_task_event(from_agent: str, to_agent: str, task: Task,
     label = _TASK_EVENT_LABEL.get(task.status, event)
     text = f"【任务·{label}】#{task.id} {task.title}" + (f"——{note}" if note else "")
     msg = DirectMessage(from_agent=from_agent, to_agent=to_agent, berth=task.berth,
-                        message=text, correlation_id=task.id)
+                        message=text, correlation_id=task.id, kind="task_event")
     store.add_message(msg)
     _audit("task.notify", from_agent, f"agent:{to_agent}", {
         "task_id": task.id, "status": task.status.value,
@@ -1487,7 +1529,7 @@ async def _sweep_stale_tasks() -> None:
 
 @mcp.tool()
 async def create_task(
-    creator: str, token: str, assignee: str, title: str,
+    creator: str, token: str = "", assignee: str = "", title: str = "",
     detail: str = "", berth: str = "", correlation_id: str = "", deadline: str = "",
 ) -> str:
     """交办任务：把一件事托付给另一个 Agent，带双方认账的生命周期（与私信的区别）。
@@ -1561,7 +1603,7 @@ def _load_task_for(agent_id: str, task_id: str) -> tuple[Task | None, str | None
 
 @mcp.tool()
 async def update_task(
-    task_id: str, agent_id: str, token: str, status: str, note: str = "",
+    task_id: str, agent_id: str, token: str = "", status: str = "", note: str = "",
 ) -> str:
     """受托方推进任务状态（执行类转移只能由 assignee 做）。
 
@@ -1647,7 +1689,7 @@ async def cancel_task(
 
 
 @mcp.tool()
-def get_task(task_id: str, agent_id: str, token: str) -> str:
+def get_task(task_id: str, agent_id: str, token: str = "") -> str:
     """查任务详情（含状态、成果、时限），只对当事双方可见。
     附带该任务线上的最近 5 条消息（correlation_id=task_id 的双方往来）。"""
     store = _get_store()
@@ -1670,7 +1712,7 @@ def get_task(task_id: str, agent_id: str, token: str) -> str:
 
 
 @mcp.tool()
-def list_tasks(agent_id: str, token: str, status: str = "", role: str = "") -> str:
+def list_tasks(agent_id: str, token: str = "", status: str = "", role: str = "") -> str:
     """列出自己参与的任务（交办给我的 / 我交办的）。status 过滤状态，role=creator/assignee 过滤角色。"""
     store = _get_store()
 
@@ -1694,7 +1736,7 @@ def list_tasks(agent_id: str, token: str, status: str = "", role: str = "") -> s
 
 
 @mcp.tool()
-async def ack_messages(agent_id: str, token: str, message_ids: list[str]) -> str:
+async def ack_messages(agent_id: str, token: str = "", message_ids: list[str] | None = None) -> str:
     """确认收到并认领私信（ack）。比已读更强：已读=看到了，ack=对这条消息负责（会去处理/执行）。
 
     发件方查自己的已发消息可以看到 acked 状态——"谁还没认领"一目了然，
@@ -1707,7 +1749,7 @@ async def ack_messages(agent_id: str, token: str, message_ids: list[str]) -> str
     if auth_err:
         return json.dumps({"error": auth_err}, ensure_ascii=False)
 
-    acked = store.mark_messages_acked(agent_id, message_ids)
+    acked = store.mark_messages_acked(agent_id, message_ids or [])
     _audit("message.ack", agent_id, "self", {"acked": len(acked)})
 
     # 在线的原发件人立刻知道"对方认领了"
@@ -1815,7 +1857,7 @@ def diff_versions(
 
 @mcp.tool()
 def get_notifications(
-    admin_token: str,
+    admin_token: str = "",
     berth: str = "",
     limit: int = 50,
 ) -> str:
@@ -1833,8 +1875,11 @@ def get_notifications(
 
 
 @mcp.tool()
-def get_audit_log(admin_token: str, limit: int = 50, action: str = "", actor: str = "", berth: str = "") -> str:
-    """查询审计日志（仅 admin）。需要 MCPHARBOR_ADMIN_TOKEN。支持按操作、操作者、Berth 过滤。"""
+def get_audit_log(admin_token: str = "", limit: int = 50, action: str = "", actor: str = "",
+                  berth: str = "", task_id: str = "") -> str:
+    """查询审计日志（仅 admin）。需要 MCPHARBOR_ADMIN_TOKEN。
+    支持按操作、操作者、Berth、任务过滤（task_id 会同时匹配状态转移和任务事件通知，
+    用于拉取一个任务的完整时间线）。"""
     err = _check_admin(admin_token)
     if err:
         return json.dumps({"error": err}, ensure_ascii=False)
@@ -1845,6 +1890,7 @@ def get_audit_log(admin_token: str, limit: int = 50, action: str = "", actor: st
         action=action or None,
         actor=actor or None,
         berth=berth or None,
+        task_id=task_id or None,
     )
     return json.dumps({
         "entries": [e.model_dump(mode="json") for e in entries],

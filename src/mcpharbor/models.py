@@ -125,6 +125,10 @@ class DirectMessage(BaseModel):
     correlation_id: str = ""
     reply_to: str = ""
     severity: NotifyPriority = NotifyPriority.NORMAL
+    # kind 区分消息来源：chat=真人私信；task_event=任务状态转移的自动通知；
+    # admin_command=admin 下发的指令。任务事件是操作者动作的回执，操作者自己全知道，
+    # 不应刷屏他自己的对话流（chat_total 不计、自己视角的收件箱默认过滤）。
+    kind: str = "chat"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     read: bool = False
     # ack = 收件方明确确认"收到并认领"（比已读更强：已读只代表看到，ack 代表对这个消息负责）

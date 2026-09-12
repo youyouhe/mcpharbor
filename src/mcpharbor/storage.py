@@ -111,6 +111,7 @@ class HarborStorage:
                 correlation_id TEXT NOT NULL DEFAULT '',
                 reply_to TEXT NOT NULL DEFAULT '',
                 severity TEXT NOT NULL DEFAULT 'normal',
+                kind TEXT NOT NULL DEFAULT 'chat',
                 created_at TEXT NOT NULL,
                 read INTEGER NOT NULL DEFAULT 0
             );
@@ -183,6 +184,8 @@ class HarborStorage:
             conn.execute("ALTER TABLE messages ADD COLUMN acked INTEGER NOT NULL DEFAULT 0")
         if "acked_at" not in msg_cols:
             conn.execute("ALTER TABLE messages ADD COLUMN acked_at TEXT")
+        if "kind" not in msg_cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'chat'")
         conn.commit()
 
     # ── Berth CRUD ──
@@ -632,6 +635,7 @@ class HarborStorage:
             berth=r["berth"], message=r["message"], correlation_id=r["correlation_id"],
             reply_to=r["reply_to"] if "reply_to" in r.keys() else "",
             severity=NotifyPriority(r["severity"]),
+            kind=r["kind"] if "kind" in r.keys() else "chat",
             created_at=datetime.fromisoformat(r["created_at"]), read=bool(r["read"]),
             acked=bool(r["acked"]) if "acked" in r.keys() else False,
             acked_at=datetime.fromisoformat(r["acked_at"]) if r["acked_at"] not in (None, "") else None
@@ -642,11 +646,11 @@ class HarborStorage:
         conn = self._get_conn()
         conn.execute("""
             INSERT INTO messages (id, from_agent, to_agent, berth, message,
-                correlation_id, reply_to, severity, created_at, read, acked, acked_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                correlation_id, reply_to, severity, kind, created_at, read, acked, acked_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             msg.id, msg.from_agent, msg.to_agent, msg.berth, msg.message,
-            msg.correlation_id, msg.reply_to, msg.severity.value,
+            msg.correlation_id, msg.reply_to, msg.severity.value, msg.kind,
             msg.created_at.isoformat(), int(msg.read), int(msg.acked),
             msg.acked_at.isoformat() if msg.acked_at else None,
         ))
@@ -661,14 +665,23 @@ class HarborStorage:
     def get_messages(
         self, agent_id: str, with_agent: str | None = None,
         unread_only: bool = False, limit: int = 50,
+        hide_own_task_events: bool = False,
     ) -> list[DirectMessage]:
-        """返回 agent_id 作为收件人或发件人的私信，按时间倒序。"""
+        """返回 agent_id 作为收件人或发件人的私信，按时间倒序。
+
+        hide_own_task_events：过滤掉"自己发出的任务事件通知"（kind=task_event 且
+        from_agent=自己）。这些是操作者动作的回执，操作者全知道，留在收件箱里
+        只会把对话流撑高、淹没真消息。查完整任务事件线（get_task）时不要开。
+        """
         conn = self._get_conn()
         conditions = ["(to_agent=? OR from_agent=?)"]
         params: list[Any] = [agent_id, agent_id]
         if with_agent:
             conditions.append("(to_agent=? OR from_agent=?)")
             params.extend([with_agent, with_agent])
+        if hide_own_task_events:
+            conditions.append("NOT (kind='task_event' AND from_agent=?)")
+            params.append(agent_id)
         if unread_only:
             conditions.append("to_agent=? AND read=0")
             params.append(agent_id)
@@ -694,6 +707,10 @@ class HarborStorage:
         by_peer: dict[str, dict[str, Any]] = {}
         for r in rows:
             msg = self._row_to_message(r)
+            # 自己发出的任务事件通知不占自己的对话流（对方视角照常可见），
+            # 否则交办几个任务 total 就翻几倍，真消息反而被淹没。
+            if msg.kind == "task_event" and msg.from_agent == agent_id:
+                continue
             peer = msg.from_agent if msg.to_agent == agent_id else msg.to_agent
             entry = by_peer.get(peer)
             if entry is None:
@@ -770,7 +787,8 @@ class HarborStorage:
         conn.commit()
 
     def get_audit_log(self, limit: int = 100, action: str | None = None,
-                      actor: str | None = None, berth: str | None = None) -> list[AuditEntry]:
+                      actor: str | None = None, berth: str | None = None,
+                      task_id: str | None = None) -> list[AuditEntry]:
         conn = self._get_conn()
         conditions = []
         params: list[Any] = []
@@ -783,6 +801,10 @@ class HarborStorage:
         if berth:
             conditions.append("target LIKE ?")
             params.append(f"%berth:{berth}%")
+        if task_id:
+            # 任务全链路：target=task:{id} 的状态转移 + detail 里带 task_id 的事件通知
+            conditions.append("(target=? OR detail LIKE ?)")
+            params.extend([f"task:{task_id}", f'%"task_id": "{task_id}"%'])
 
         where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
         params.append(limit)
