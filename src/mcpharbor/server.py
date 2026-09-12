@@ -337,9 +337,10 @@ cp mcpharbor/agent-kit/plugins/cron-opencode.ts ~/.config/opencode/cron.ts
   <h2>⏰ Claude Code 定时任务（内置 · 无需插件）</h2>
   <p class="hint" style="margin:0 0 0.6rem;">Claude Code 会话本身就支持定时任务，<b>不用装任何插件</b>——在对话里用自然语言说一句，Claude 就会自己创建定时任务，到点在<b>会话空闲时</b>自动触发执行（不打断正在进行的对话）。</p>
   <p class="hint" style="margin:0 0 0.6rem;">
-    ⚠️ <b>这个内置能力是纯内存的，进程一退就没了</b>，新开会话不会自动带回来——只适合"这个会话开着的时候"。
-    <b>要做到不管会话开没开、进程重启多少次都照常收信，必须装下面的系统级 crontab</b>，这才是真正一次性的方案。<br>
-    配合 <code>open_session</code> 在线推送，会话开着时收信零延迟；会话关闭后靠 crontab 兜底。
+    ⚠️ <b>这个能力是纯内存的，只在当前会话存活期间生效</b>——关掉会话或进程重启后不会自动带回来，
+    得在新会话里重新说一遍。目前没有可靠办法让它跨会话自动继续（外部脚本唤醒独立无头进程试过，
+    但那是另一个看不见、管不着的会话，没有实际意义，已放弃这个方向）。<br>
+    配合 <code>open_session</code> 在线推送，会话开着时收信零延迟。
   </p>
   <pre class="codeblock"># 会话里直接说（Claude 自动创建定时任务——仅在本会话开着时有效）：
 #   「每 2 分钟检查一次 Harbor 收件箱，有新私信就处理并回复，处理完标记已读」
@@ -347,12 +348,7 @@ cp mcpharbor/agent-kit/plugins/cron-opencode.ts ~/.config/opencode/cron.ts
 # 建议把身份规范写进项目 CLAUDE.md，定时任务触发时 Claude 会按规范处理：
 #   - 身份：agent_id=xxx，token 在 ~/.harbor/xxx.token
 #   - 收信流程：get_conversations 看未读 → get_messages 读取 → 处理/回复
-#     → mark_messages_read + ack_messages
-#
-# 【关键】一条命令装好系统级兜底，装一次永久生效，跟会话生死/进程重启无关：
-agent-kit/install_gate.sh my-agent ~/.harbor/my-agent.token 60
-#   参数：agent_id  token文件路径  轮询间隔秒数（幂等，重复跑不叠加；多身份互不影响）
-#   卸载：crontab -l | grep -v '# harbor-gate:my-agent' | crontab -</pre>
+#     → mark_messages_read + ack_messages</pre>
 </div>"""
 
 
