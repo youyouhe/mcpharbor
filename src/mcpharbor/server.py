@@ -19,9 +19,22 @@ from mcp.server.session import ServerSession
 
 from .models import (
     AuditEntry, Berth, BerthStatus, Contract, ContractPin, DirectMessage, Manifest,
-    Notification, NotifyPriority, Subscription,
+    Notification, NotifyPriority, Subscription, Task, TaskStatus,
 )
 from .storage import HarborStorage
+
+# ── 任务状态机 ──
+# 终态之后冻结；worker 态（执行类转移）只能由 assignee 推动，canceled 只能由 creator/admin 推动。
+_TASK_TERMINAL = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELED, TaskStatus.REJECTED}
+_TASK_WORKER_MOVES = {TaskStatus.ACCEPTED, TaskStatus.WORKING, TaskStatus.INPUT_REQUIRED,
+                      TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.REJECTED}
+_TASK_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
+    TaskStatus.CREATED: {TaskStatus.ACCEPTED, TaskStatus.REJECTED, TaskStatus.CANCELED},
+    TaskStatus.ACCEPTED: {TaskStatus.WORKING, TaskStatus.CANCELED},
+    TaskStatus.WORKING: {TaskStatus.INPUT_REQUIRED, TaskStatus.COMPLETED,
+                         TaskStatus.FAILED, TaskStatus.CANCELED},
+    TaskStatus.INPUT_REQUIRED: {TaskStatus.WORKING, TaskStatus.CANCELED},
+}
 
 # 会话健康状态：agent_id -> {"alive": bool, "checked_at": iso}
 # 心跳只探测、只记录、只展示，绝不把会话从 _live_sessions 踢掉。
@@ -31,7 +44,7 @@ _HEARTBEAT_TIMEOUT_SECONDS = 5
 
 
 async def _heartbeat_loop() -> None:
-    """定时对登记在册的活跃会话发 MCP ping，记录存活状态。"""
+    """定时对登记在册的活跃会话发 MCP ping，记录存活状态；顺带做任务超时扫尾。"""
     while True:
         for agent_id, session in list(_live_sessions.items()):
             alive = True
@@ -43,6 +56,10 @@ async def _heartbeat_loop() -> None:
                 "alive": alive,
                 "checked_at": datetime.now(timezone.utc).isoformat(),
             }
+        try:
+            await _sweep_stale_tasks()
+        except Exception:
+            pass  # 扫尾失败不影响心跳主职责，下一轮再试
         await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
 
 
@@ -180,6 +197,14 @@ def _collect_admin_overview() -> dict[str, Any]:
         ],
         "message_count": store.count_messages(),
         "notification_count": store.count_notifications(),
+        "recent_tasks": [
+            {
+                "id": t.id, "title": t.title, "creator": t.creator, "assignee": t.assignee,
+                "status": t.status.value, "deadline": t.deadline or "—",
+                "updated_at": t.updated_at.isoformat(),
+            }
+            for t in store.list_all_tasks(limit=20)
+        ],
         "recent_notifications": [n.model_dump(mode="json") for n in store.get_notification_history(limit=20)],
         "recent_audit": [e.model_dump(mode="json") for e in store.get_audit_log(limit=20)],
         "live_agents": sorted(_live_sessions.keys()),
@@ -209,6 +234,16 @@ def _render_admin_html(data: dict[str, Any], mcp_url: str = "") -> str:
     )
     berths_rows = _rows(data["berths"], ["id", "owner", "version", "status", "capabilities", "contact"])
     subs_rows = _rows(data["subscriptions"], ["subscriber", "berth", "events", "version_range"])
+    task_status_badge = {"created": "🆕", "accepted": "🙋", "working": "🔧",
+                         "input_required": "⏸", "completed": "✅", "failed": "❌",
+                         "canceled": "🚫", "rejected": "🙅"}
+    tasks_rows = _rows(
+        [{"id": t["id"], "title": t["title"], "creator": t["creator"], "assignee": t["assignee"],
+          "status": f"{task_status_badge.get(t['status'], '')} {t['status']}",
+          "deadline": t["deadline"], "updated_at": t["updated_at"]}
+         for t in data.get("recent_tasks", [])],
+        ["id", "title", "creator", "assignee", "status", "deadline", "updated_at"],
+    )
     notif_rows = _rows(
         [{"created_at": n["created_at"], "berth": n["berth"], "old_version": n["old_version"],
           "new_version": n["new_version"], "severity": n["severity"], "summary": n["summary"]}
@@ -243,12 +278,12 @@ def _render_admin_html(data: dict[str, Any], mcp_url: str = "") -> str:
     tools_card = """
 <div class="card connect" style="border-left-color:#16a34a;">
   <h2>🧰 工具清单与"没有工具"排查</h2>
-  <p class="hint" style="margin:0 0 0.6rem;">Harbor 共 <b>27 个工具</b>，实际暴露的工具名<b>不带 <code>harbor.</code> 前缀</b>（README 里的 <code>harbor.xxx</code> 只是文档写法）：<code>register_agent</code>、<code>rotate_token</code>、<code>publish_manifest</code>、<code>get_manifest</code>、<code>search_berths</code>、<code>subscribe</code>、<code>open_session</code>、<code>send_message</code>、<code>get_messages</code>、<code>mark_messages_read</code>、<code>get_conversations</code>、<code>search_agents</code>、<code>admin_command</code>、<code>admin_manage_agent</code>、<code>admin_manage_berth</code>、<code>admin_cleanup</code>、<code>notify</code>、<code>resolve_dependency</code>、<code>check_compat</code>、<code>pin_contract</code>、<code>unpin_contract</code>、<code>get_my_pins</code>、<code>check_updates</code>、<code>sync</code>、<code>diff_versions</code>、<code>get_notifications</code>、<code>get_audit_log</code>。</p>
+  <p class="hint" style="margin:0 0 0.6rem;">Harbor 共 <b>33 个工具</b>，实际暴露的工具名<b>不带 <code>harbor.</code> 前缀</b>（README 里的 <code>harbor.xxx</code> 只是文档写法）：<code>register_agent</code>、<code>rotate_token</code>、<code>publish_manifest</code>、<code>get_manifest</code>、<code>search_berths</code>、<code>subscribe</code>、<code>open_session</code>、<code>send_message</code>、<code>get_messages</code>、<code>mark_messages_read</code>、<code>get_conversations</code>、<code>search_agents</code>、<code>admin_command</code>、<code>admin_manage_agent</code>、<code>admin_manage_berth</code>、<code>admin_cleanup</code>、<code>notify</code>、<code>resolve_dependency</code>、<code>check_compat</code>、<code>pin_contract</code>、<code>unpin_contract</code>、<code>get_my_pins</code>、<code>create_task</code>、<code>update_task</code>、<code>get_task</code>、<code>list_tasks</code>、<code>cancel_task</code>、<code>ack_messages</code>、<code>check_updates</code>、<code>sync</code>、<code>diff_versions</code>、<code>get_notifications</code>、<code>get_audit_log</code>。</p>
   <p class="hint" style="margin:0;">如果某个 Agent 连上后说"只看到资源、没有工具"，问题几乎都在客户端侧，按概率排查：
     ① 客户端 MCP 实现残缺——不少网页聊天 Agent 只调 <code>resources/list</code> 不调 <code>tools/list</code>，能看到 <code>harbor://berths</code> 说明连接是通的；
     ② 按 <code>harbor.*</code> 前缀找工具——实际是裸名字；
     ③ transport/端点不匹配——streamable-http 端点是 <code>/mcp</code>，有的客户端只连 <code>/sse</code>。
-    服务端自检：用 fastmcp Client 连上来跑 <code>list_tools()</code>，能看到 27 个工具就说明问题在对方。</p>
+    服务端自检：用 fastmcp Client 连上来跑 <code>list_tools()</code>，能看到 33 个工具就说明问题在对方。</p>
   <p class="hint" style="margin:0.4rem 0 0;">📌 注册新规：<code>register_agent</code> 必须提交 <code>display_name</code>（显示名）和 <code>description</code>（身份用途），agent_id 仅限小写字母/数字/连字符；同一 agent_id 重复注册会被拒绝——一个 Agent 只需要一个身份。</p>
 </div>"""
 
@@ -406,6 +441,11 @@ code {{
 <div class="card">
 <h2>订阅关系（{len(data['subscriptions'])}）</h2>
 <table><tr><th>subscriber</th><th>berth</th><th>events</th><th>version_range</th></tr>{subs_rows}</table>
+</div>
+
+<div class="card">
+<h2>任务（最多20条）</h2>
+<table><tr><th>id</th><th>标题</th><th>交办方</th><th>受托方</th><th>状态</th><th>截止</th><th>更新时间</th></tr>{tasks_rows}</table>
 </div>
 
 <div class="card">
@@ -1090,17 +1130,19 @@ def admin_manage_agent(admin_token: str, agent_id: str, action: str) -> str:
                      f"再 purge，否则这些项目卡会变成无主状态。",
         }, ensure_ascii=False)
 
-    removed_subs, removed_msgs = store.purge_agent(agent_id)
+    removed_subs, removed_msgs, removed_tasks = store.purge_agent(agent_id)
     _live_sessions.pop(agent_id, None)
     _audit("admin.purge_agent", "admin", f"agent:{agent_id}", {
         "removed_subscriptions": removed_subs, "removed_messages": removed_msgs,
+        "removed_tasks": removed_tasks,
     })
     return json.dumps({
         "status": "ok", "action": "purge", "agent_id": agent_id,
         "removed_subscriptions": removed_subs,
         "removed_messages": removed_msgs,
+        "removed_tasks": removed_tasks,
         "message": (f"已彻底删除 {agent_id} 的注册记录"
-                    f"（连带清理 {removed_subs} 条订阅、{removed_msgs} 条私信）。"),
+                    f"（连带清理 {removed_subs} 条订阅、{removed_msgs} 条私信、{removed_tasks} 个任务）。"),
     }, ensure_ascii=False)
 
 
@@ -1374,6 +1416,276 @@ def get_my_pins(agent_id: str, token: str) -> str:
             "stale": bool(latest_version and latest_version != p.version),
         })
     return json.dumps({"pins": result, "count": len(result)}, ensure_ascii=False)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Task（任务状态机）— 把"说一句话"升级成"托付一件事"
+# ═══════════════════════════════════════════════════════════════════
+
+_TASK_EVENT_LABEL = {
+    TaskStatus.ACCEPTED: "已接单", TaskStatus.WORKING: "进行中",
+    TaskStatus.INPUT_REQUIRED: "卡住等补料", TaskStatus.COMPLETED: "已完成",
+    TaskStatus.FAILED: "失败", TaskStatus.REJECTED: "已拒单",
+    TaskStatus.CANCELED: "已取消", TaskStatus.CREATED: "新交办",
+}
+
+
+async def _notify_task_event(from_agent: str, to_agent: str, task: Task,
+                             event: str, note: str = "") -> bool:
+    """任务事件写进双方对话流（收件箱可见、correlation_id=task.id 串线程）+ 尝试原生推送。"""
+    store = _get_store()
+    label = _TASK_EVENT_LABEL.get(task.status, event)
+    text = f"【任务·{label}】#{task.id} {task.title}" + (f"——{note}" if note else "")
+    msg = DirectMessage(from_agent=from_agent, to_agent=to_agent, berth=task.berth,
+                        message=text, correlation_id=task.id)
+    store.add_message(msg)
+    _audit("task.notify", from_agent, f"agent:{to_agent}", {
+        "task_id": task.id, "status": task.status.value,
+    })
+    return await _push_notification(
+        to_agent, f"harbor://messages/{to_agent}",
+        change_type="task_event", task_id=task.id, status=task.status.value, summary=text,
+    )
+
+
+async def _sweep_stale_tasks() -> None:
+    """过了 deadline 仍未到终态的任务自动标 failed，并通知交办方（防"永远 working"）。"""
+    for task in _get_store().sweep_stale_tasks():
+        _audit("task.sweep", "system", f"task:{task.id}", {"deadline": task.deadline})
+        await _notify_task_event("system", task.creator, task, "超时",
+                                 note=f"截止 {task.deadline} 未完成，已自动标记失败")
+
+
+@mcp.tool()
+async def create_task(
+    creator: str, token: str, assignee: str, title: str,
+    detail: str = "", berth: str = "", correlation_id: str = "", deadline: str = "",
+) -> str:
+    """交办任务：把一件事托付给另一个 Agent，带双方认账的生命周期（与私信的区别）。
+
+    私信是"说了句话"，任务是"托付了件事"：可查（get_task）、可催、可撤（cancel_task）、
+    有终态（completed/failed/canceled/rejected），超时自动标失败——不用再靠读聊天记录猜进度。
+    受托方用 update_task 推进：accepted → working → completed/failed（或 rejected 拒单、
+    input_required 卡住等补料）。每次状态变化双方都会收到通知（走私信收件箱+推送）。
+
+    - title：一句话说清要什么（必填）
+    - detail：补充说明/验收标准
+    - deadline：截止时间（ISO 格式如 2026-09-13T18:00 或 2026-09-13 18:00），空=不限时
+    - correlation_id：要与哪条消息线串起来（可选；任务自身的事件消息会以 task_id 串线）
+    """
+    store = _get_store()
+
+    auth_err = _check_auth(creator, token)
+    if auth_err:
+        _audit("auth.denied", creator, f"agent:{assignee}", {"reason": auth_err})
+        return json.dumps({"error": auth_err}, ensure_ascii=False)
+    if not title.strip():
+        return json.dumps({"error": "title 必填：一句话说清要托付什么"}, ensure_ascii=False)
+    if store.get_agent_token(assignee) is None:
+        return json.dumps({"error": f"受托方 agent_id={assignee} 未注册"}, ensure_ascii=False)
+
+    deadline_iso = ""
+    if deadline:
+        try:
+            deadline_iso = datetime.fromisoformat(deadline.replace(" ", "T")).isoformat()
+        except ValueError:
+            return json.dumps({"error": "deadline 格式不对，要 ISO 格式如 2026-09-13T18:00"}, ensure_ascii=False)
+
+    task = Task(creator=creator, assignee=assignee, title=title.strip(),
+                detail=detail, berth=berth, correlation_id=correlation_id,
+                deadline=deadline_iso)
+    store.create_task(task)
+    _audit("task.create", creator, f"task:{task.id}", {
+        "assignee": assignee, "title": title.strip(), "deadline": deadline_iso,
+    })
+
+    pushed = await _notify_task_event(creator, assignee, task, "新交办",
+                                      note=detail if detail else "请 update_task 接单或拒单")
+
+    return json.dumps({
+        "status": "ok", "task_id": task.id, "task_status": task.status.value,
+        "assignee": assignee, "deadline": deadline_iso,
+        "pushed": pushed,
+        "message": (f"任务 #{task.id} 已交办给 {assignee}"
+                    + ("（对方在线已推送）" if pushed else "（对方不在线，已落收件箱等其轮询）")),
+    }, ensure_ascii=False)
+
+
+def _load_task_for(agent_id: str, task_id: str) -> tuple[Task | None, str | None]:
+    """加载任务并校验参与方身份。返回 (task, error)。"""
+    store = _get_store()
+    task = store.get_task(task_id)
+    if task is None:
+        return None, f"任务 {task_id} 不存在"
+    if agent_id not in (task.creator, task.assignee):
+        return None, f"任务 {task_id} 只对当事方（{task.creator}/{task.assignee}）可见"
+    return task, None
+
+
+@mcp.tool()
+async def update_task(
+    task_id: str, agent_id: str, token: str, status: str, note: str = "",
+) -> str:
+    """受托方推进任务状态（执行类转移只能由 assignee 做）。
+
+    合法转移：created→accepted/rejected；accepted→working；working→input_required/
+    completed/failed；input_required→working。终态（completed/failed/canceled/rejected）
+    之后冻结。completed/failed 时把 note 存为 result（任务成果）。取消任务用 cancel_task。
+    每次转移自动通知对方（收件箱+推送）。
+    """
+    store = _get_store()
+
+    auth_err = _check_auth(agent_id, token)
+    if auth_err:
+        return json.dumps({"error": auth_err}, ensure_ascii=False)
+
+    task, err = _load_task_for(agent_id, task_id)
+    if err:
+        return json.dumps({"error": err}, ensure_ascii=False)
+
+    try:
+        target = TaskStatus(status)
+    except ValueError:
+        return json.dumps({"error": f"未知状态 {status}，可选：{[s.value for s in TaskStatus]}"}, ensure_ascii=False)
+
+    if task.status in _TASK_TERMINAL:
+        return json.dumps({"error": f"任务已到终态 {task.status.value}，不能再改"}, ensure_ascii=False)
+    if target == TaskStatus.CANCELED:
+        return json.dumps({"error": "取消任务请用 cancel_task"}, ensure_ascii=False)
+    if target in _TASK_WORKER_MOVES and agent_id != task.assignee:
+        return json.dumps({"error": f"执行类状态转移只能由受托方 {task.assignee} 操作"}, ensure_ascii=False)
+    if target not in _TASK_TRANSITIONS[task.status]:
+        allowed = ", ".join(s.value for s in _TASK_TRANSITIONS[task.status])
+        return json.dumps({"error": f"不允许 {task.status.value} → {target.value}；当前可转：{allowed}"}, ensure_ascii=False)
+
+    updated = store.update_task_status(task_id, target, result=note if target in _TASK_TERMINAL else "")
+    _audit("task.update", agent_id, f"task:{task_id}", {"to": target.value, "note": note[:200]})
+
+    pushed = await _notify_task_event(agent_id, task.creator if agent_id == task.assignee else task.assignee,
+                                      updated, target.value, note=note)
+
+    return json.dumps({
+        "status": "ok", "task_id": task_id, "task_status": updated.status.value,
+        "result": updated.result, "pushed": pushed,
+        "message": f"任务 #{task_id}: {task.status.value} → {target.value}",
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+async def cancel_task(
+    task_id: str, agent_id: str = "", token: str = "", admin_token: str = "", reason: str = "",
+) -> str:
+    """取消任务（交办方或 admin；未到终态才可取消）。取消后受托方收到通知。"""
+    store = _get_store()
+
+    is_admin = False
+    if admin_token:
+        if _check_admin(admin_token):
+            return json.dumps({"error": _check_admin(admin_token)}, ensure_ascii=False)
+        is_admin = True
+    else:
+        auth_err = _check_auth(agent_id, token)
+        if auth_err:
+            return json.dumps({"error": auth_err}, ensure_ascii=False)
+
+    task, err = _load_task_for(agent_id or "admin", task_id) if not is_admin else (store.get_task(task_id), None)
+    if err or task is None:
+        return json.dumps({"error": err or f"任务 {task_id} 不存在"}, ensure_ascii=False)
+    if not is_admin and agent_id != task.creator:
+        return json.dumps({"error": f"只有交办方 {task.creator}（或 admin）可以取消"}, ensure_ascii=False)
+    if task.status in _TASK_TERMINAL:
+        return json.dumps({"error": f"任务已到终态 {task.status.value}，无需取消"}, ensure_ascii=False)
+
+    updated = store.update_task_status(task_id, TaskStatus.CANCELED,
+                                       result=reason or f"由{'admin' if is_admin else agent_id}取消")
+    _audit("task.cancel", "admin" if is_admin else agent_id, f"task:{task_id}", {"reason": reason[:200]})
+
+    pushed = await _notify_task_event("admin" if is_admin else agent_id, task.assignee,
+                                      updated, "canceled", note=reason)
+
+    return json.dumps({
+        "status": "ok", "task_id": task_id, "task_status": updated.status.value,
+        "pushed": pushed, "message": f"任务 #{task_id} 已取消",
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+def get_task(task_id: str, agent_id: str, token: str) -> str:
+    """查任务详情（含状态、成果、时限），只对当事双方可见。
+    附带该任务线上的最近 5 条消息（correlation_id=task_id 的双方往来）。"""
+    store = _get_store()
+
+    auth_err = _check_auth(agent_id, token)
+    if auth_err:
+        return json.dumps({"error": auth_err}, ensure_ascii=False)
+
+    task, err = _load_task_for(agent_id, task_id)
+    if err:
+        return json.dumps({"error": err}, ensure_ascii=False)
+
+    related = store.get_messages(task.creator, with_agent=task.assignee, limit=50)
+    related = [m for m in related if m.correlation_id == task_id][:5]
+
+    return json.dumps({
+        "task": task.model_dump(mode="json"),
+        "related_messages": [m.model_dump(mode="json") for m in related],
+    }, ensure_ascii=False, default=str)
+
+
+@mcp.tool()
+def list_tasks(agent_id: str, token: str, status: str = "", role: str = "") -> str:
+    """列出自己参与的任务（交办给我的 / 我交办的）。status 过滤状态，role=creator/assignee 过滤角色。"""
+    store = _get_store()
+
+    auth_err = _check_auth(agent_id, token)
+    if auth_err:
+        return json.dumps({"error": auth_err}, ensure_ascii=False)
+
+    if status:
+        try:
+            TaskStatus(status)
+        except ValueError:
+            return json.dumps({"error": f"未知状态 {status}"}, ensure_ascii=False)
+    if role not in ("", "creator", "assignee"):
+        return json.dumps({"error": "role 只能是 creator / assignee / 留空"}, ensure_ascii=False)
+
+    tasks = store.list_tasks(agent_id, status=status or "", role=role)
+    return json.dumps({
+        "tasks": [t.model_dump(mode="json") for t in tasks],
+        "count": len(tasks),
+    }, ensure_ascii=False, default=str)
+
+
+@mcp.tool()
+async def ack_messages(agent_id: str, token: str, message_ids: list[str]) -> str:
+    """确认收到并认领私信（ack）。比已读更强：已读=看到了，ack=对这条消息负责（会去处理/执行）。
+
+    发件方查自己的已发消息可以看到 acked 状态——"谁还没认领"一目了然，
+    适合"交办了要等认领"的场景（配合任务状态机：create_task 后等 assignee ack 再动手）。
+    ack 时若发件方在线，会收到原生推送提醒。
+    """
+    store = _get_store()
+
+    auth_err = _check_auth(agent_id, token)
+    if auth_err:
+        return json.dumps({"error": auth_err}, ensure_ascii=False)
+
+    acked = store.mark_messages_acked(agent_id, message_ids)
+    _audit("message.ack", agent_id, "self", {"acked": len(acked)})
+
+    # 在线的原发件人立刻知道"对方认领了"
+    push_targets = {m.from_agent for m in acked if m.from_agent != agent_id}
+    for target in push_targets:
+        await _push_notification(
+            target, f"harbor://messages/{target}",
+            change_type="message_acked", acked_by=agent_id,
+            summary=f"{agent_id} 已认领你的 {len([m for m in acked if m.from_agent == target])} 条消息",
+        )
+
+    return json.dumps({
+        "status": "ok", "acked": len(acked),
+        "message": f"已确认认领 {len(acked)} 条消息" + ("（未找到或不属于自己的已跳过）" if len(acked) != len(message_ids) else ""),
+    }, ensure_ascii=False)
 
 
 @mcp.tool()

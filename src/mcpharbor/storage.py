@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from .models import (
     AgentToken, AuditEntry, Berth, BerthStatus, Contract, ContractPin, DirectMessage,
-    Manifest, Notification, NotifyPriority, Subscription,
+    Manifest, Notification, NotifyPriority, Subscription, Task, TaskStatus,
 )
 
 
@@ -125,6 +125,25 @@ class HarborStorage:
                 UNIQUE(agent_id, berth, task_id)
             );
 
+            CREATE TABLE IF NOT EXISTS tasks (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                creator TEXT NOT NULL,
+                assignee TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                berth TEXT NOT NULL DEFAULT '',
+                correlation_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'created',
+                result TEXT NOT NULL DEFAULT '',
+                deadline TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee);
+            CREATE INDEX IF NOT EXISTS idx_tasks_creator ON tasks(creator);
+            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+
             CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_agent);
             CREATE INDEX IF NOT EXISTS idx_messages_from ON messages(from_agent);
 
@@ -156,10 +175,14 @@ class HarborStorage:
             conn.execute("ALTER TABLE agent_tokens ADD COLUMN capabilities TEXT NOT NULL DEFAULT '[]'")
         if "hidden" not in existing_cols:
             conn.execute("ALTER TABLE agent_tokens ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
-        # messages 补 reply_to（对旧消息引用链路向下兼容，旧行默认空串）
+        # messages 补 reply_to / ack（对旧消息向下兼容，旧行默认未 ack）
         msg_cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
         if "reply_to" not in msg_cols:
             conn.execute("ALTER TABLE messages ADD COLUMN reply_to TEXT NOT NULL DEFAULT ''")
+        if "acked" not in msg_cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN acked INTEGER NOT NULL DEFAULT 0")
+        if "acked_at" not in msg_cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN acked_at TEXT")
         conn.commit()
 
     # ── Berth CRUD ──
@@ -537,19 +560,24 @@ class HarborStorage:
         conn.commit()
         return cur.rowcount > 0
 
-    def purge_agent(self, agent_id: str) -> tuple[int, int]:
-        """彻底删除 agent 的注册记录及其全部订阅、私信、契约钉，返回 (删除订阅数, 删除私信数)。"""
+    def purge_agent(self, agent_id: str) -> tuple[int, int, int]:
+        """彻底删除 agent 的注册记录及其全部订阅、私信、契约钉、参与的任务，
+        返回 (删除订阅数, 删除私信数, 删除任务数)。"""
         conn = self._get_conn()
         subs = conn.execute("SELECT COUNT(*) AS n FROM subscriptions WHERE subscriber=?", (agent_id,)).fetchone()["n"]
         msgs = conn.execute(
             "SELECT COUNT(*) AS n FROM messages WHERE from_agent=? OR to_agent=?", (agent_id, agent_id)
         ).fetchone()["n"]
+        tasks = conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE creator=? OR assignee=?", (agent_id, agent_id)
+        ).fetchone()["n"]
         conn.execute("DELETE FROM subscriptions WHERE subscriber=?", (agent_id,))
         conn.execute("DELETE FROM messages WHERE from_agent=? OR to_agent=?", (agent_id, agent_id))
         conn.execute("DELETE FROM contract_pins WHERE agent_id=?", (agent_id,))
+        conn.execute("DELETE FROM tasks WHERE creator=? OR assignee=?", (agent_id, agent_id))
         conn.execute("DELETE FROM agent_tokens WHERE agent_id=?", (agent_id,))
         conn.commit()
-        return subs, msgs
+        return subs, msgs, tasks
 
     def rotate_agent_token(self, agent_id: str, new_token_hash: str) -> bool:
         """轮换已存在 agent_id 的令牌。若 agent_id 不存在则返回 False。"""
@@ -605,18 +633,22 @@ class HarborStorage:
             reply_to=r["reply_to"] if "reply_to" in r.keys() else "",
             severity=NotifyPriority(r["severity"]),
             created_at=datetime.fromisoformat(r["created_at"]), read=bool(r["read"]),
+            acked=bool(r["acked"]) if "acked" in r.keys() else False,
+            acked_at=datetime.fromisoformat(r["acked_at"]) if r["acked_at"] not in (None, "") else None
+            if "acked_at" in r.keys() else None,
         )
 
     def add_message(self, msg: DirectMessage) -> DirectMessage:
         conn = self._get_conn()
         conn.execute("""
             INSERT INTO messages (id, from_agent, to_agent, berth, message,
-                correlation_id, reply_to, severity, created_at, read)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                correlation_id, reply_to, severity, created_at, read, acked, acked_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             msg.id, msg.from_agent, msg.to_agent, msg.berth, msg.message,
             msg.correlation_id, msg.reply_to, msg.severity.value,
-            msg.created_at.isoformat(), int(msg.read),
+            msg.created_at.isoformat(), int(msg.read), int(msg.acked),
+            msg.acked_at.isoformat() if msg.acked_at else None,
         ))
         conn.commit()
         return msg
@@ -701,6 +733,23 @@ class HarborStorage:
             count += cur.rowcount
         conn.commit()
         return count
+
+    def mark_messages_acked(self, agent_id: str, message_ids: list[str]) -> list[DirectMessage]:
+        """收件方确认收到并认领（只能 ack 发给自己的）。返回被 ack 的消息（供推送通知原发件人）。"""
+        conn = self._get_conn()
+        now = datetime.now(timezone.utc).isoformat()
+        acked: list[DirectMessage] = []
+        for mid in message_ids:
+            cur = conn.execute(
+                "UPDATE messages SET acked=1, acked_at=? WHERE id=? AND to_agent=? AND acked=0",
+                (now, mid, agent_id),
+            )
+            if cur.rowcount:
+                row = conn.execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
+                if row:
+                    acked.append(self._row_to_message(row))
+        conn.commit()
+        return acked
 
     def count_messages(self) -> int:
         conn = self._get_conn()
@@ -827,6 +876,101 @@ class HarborStorage:
         if exclude_version:
             pins = [p for p in pins if p.version != exclude_version]
         return pins
+
+    # ── Task（任务状态机）──
+
+    def _row_to_task(self, r: sqlite3.Row) -> Task:
+        return Task(
+            id=r["id"], title=r["title"], creator=r["creator"], assignee=r["assignee"],
+            detail=r["detail"], berth=r["berth"], correlation_id=r["correlation_id"],
+            status=TaskStatus(r["status"]), result=r["result"], deadline=r["deadline"],
+            created_at=datetime.fromisoformat(r["created_at"]),
+            updated_at=datetime.fromisoformat(r["updated_at"]),
+        )
+
+    def create_task(self, task: Task) -> Task:
+        conn = self._get_conn()
+        conn.execute("""
+            INSERT INTO tasks (id, title, creator, assignee, detail, berth,
+                correlation_id, status, result, deadline, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            task.id, task.title, task.creator, task.assignee, task.detail,
+            task.berth, task.correlation_id, task.status.value, task.result,
+            task.deadline, task.created_at.isoformat(), task.updated_at.isoformat(),
+        ))
+        conn.commit()
+        return task
+
+    def get_task(self, task_id: str) -> Task | None:
+        conn = self._get_conn()
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return self._row_to_task(row) if row else None
+
+    def update_task_status(self, task_id: str, status: TaskStatus, result: str = "") -> Task | None:
+        """底层状态写入（不做转移校验，校验在 server 层）。result 非空时覆盖。"""
+        conn = self._get_conn()
+        now = datetime.now(timezone.utc).isoformat()
+        if result:
+            conn.execute(
+                "UPDATE tasks SET status=?, result=?, updated_at=? WHERE id=?",
+                (status.value, result, now, task_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE tasks SET status=?, updated_at=? WHERE id=?",
+                (status.value, now, task_id),
+            )
+        conn.commit()
+        return self.get_task(task_id)
+
+    def list_tasks(self, agent_id: str, status: str = "", role: str = "") -> list[Task]:
+        """agent 参与的任务（creator 或 assignee），可按 status / role 过滤。"""
+        conn = self._get_conn()
+        conditions = ["(creator=? OR assignee=?)"]
+        params: list[Any] = [agent_id, agent_id]
+        if status:
+            conditions.append("status=?")
+            params.append(status)
+        if role == "creator":
+            conditions.append("creator=?")
+            params.append(agent_id)
+        elif role == "assignee":
+            conditions.append("assignee=?")
+            params.append(agent_id)
+        rows = conn.execute(
+            f"SELECT * FROM tasks WHERE {' AND '.join(conditions)} ORDER BY updated_at DESC LIMIT 200",
+            params,
+        ).fetchall()
+        return [self._row_to_task(r) for r in rows]
+
+    def list_all_tasks(self, limit: int = 50) -> list[Task]:
+        """管理视角：全部任务按更新时间倒序。"""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM tasks ORDER BY updated_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [self._row_to_task(r) for r in rows]
+
+    def sweep_stale_tasks(self) -> list[Task]:
+        """把过了 deadline 仍未到终态的任务自动标 failed（防"永远 working"的状态腐烂）。"""
+        conn = self._get_conn()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE deadline!='' AND deadline<? "
+            "AND status NOT IN ('completed','failed','canceled','rejected')",
+            (now_iso,),
+        ).fetchall()
+        swept = []
+        for r in rows:
+            task = self._row_to_task(r)
+            updated = self.update_task_status(
+                task.id, TaskStatus.FAILED,
+                result=task.result or f"超时未完成（截止 {task.deadline}，心跳扫尾自动标记）",
+            )
+            if updated:
+                swept.append(updated)
+        return swept
 
     # ── Check Updates ──
 

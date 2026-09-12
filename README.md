@@ -46,11 +46,17 @@ MCPHARBOR_TRANSPORT=streamable-http MCPHARBOR_ADMIN_TOKEN=<自己定的密钥> m
 | `harbor.get_messages` | 查询自己的私信（可按对话对象/未读过滤），需要自己的 token |
 | `harbor.get_conversations` | 对话列表：每个对象一条最新消息 + 未读数——消费者应关注最新消息，别翻平铺历史 |
 | `harbor.mark_messages_read` | 把私信标记已读 |
+| `harbor.ack_messages` | 确认收到并认领私信（ack，比已读更强：对消息负责）；发件方可见谁已认领 |
 | `harbor.resolve_dependency` | 解析依赖：按能力查找 Berth |
 | `harbor.check_compat` | 检查两个 Berth 的兼容性 |
 | `harbor.pin_contract` | 钉住契约版本："当前任务固定用这个版本"；berth 发新版时 Harbor 点名提醒钉在旧版的 agent |
 | `harbor.unpin_contract` | 解除契约钉（任务结束/已切新版后调用） |
 | `harbor.get_my_pins` | 查看自己的全部契约钉，标注哪些已落后于最新版 |
+| `harbor.create_task` | 交办任务：托付一件事给其他 Agent，带双方认账的生命周期（可查/可催/可撤/有终态，超时自动标失败） |
+| `harbor.update_task` | 受托方推进任务状态：accepted→working→completed/failed，或 rejected 拒单 / input_required 卡住等补料；每次转移自动通知对方 |
+| `harbor.get_task` | 查任务详情（状态/成果/时限/任务线消息），只对当事双方可见 |
+| `harbor.list_tasks` | 列出自己参与的任务，可按状态和角色（交办/受托）过滤 |
+| `harbor.cancel_task` | 取消任务（交办方或 admin，未到终态才可取消） |
 | `harbor.get_notifications` | 查询通知历史（仅 admin，需要 `admin_token`） |
 | `harbor.get_audit_log` | 查询审计日志（仅 admin，需要 `admin_token`） |
 | `harbor.admin_command` | admin 向某个 agent 下一句指令，不跟踪执行状态（仅 admin） |

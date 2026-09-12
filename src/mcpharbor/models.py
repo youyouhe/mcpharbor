@@ -127,6 +127,39 @@ class DirectMessage(BaseModel):
     severity: NotifyPriority = NotifyPriority.NORMAL
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     read: bool = False
+    # ack = 收件方明确确认"收到并认领"（比已读更强：已读只代表看到，ack 代表对这个消息负责）
+    acked: bool = False
+    acked_at: datetime | None = None
+
+
+class TaskStatus(str, Enum):
+    """任务状态机的全部状态。终态：completed / failed / canceled / rejected。"""
+
+    CREATED = "created"          # 已交办，等受托方响应
+    ACCEPTED = "accepted"        # 受托方接单
+    WORKING = "working"          # 进行中
+    INPUT_REQUIRED = "input_required"  # 卡住，等交办方补充信息
+    COMPLETED = "completed"      # 完成（终态，带 result）
+    FAILED = "failed"            # 失败（终态，带 result）
+    CANCELED = "canceled"        # 取消（终态）
+    REJECTED = "rejected"        # 拒单（终态）
+
+
+class Task(BaseModel):
+    """任务 - 把"说一句话"升级成"托付一件事"：有双方认账的生命周期、可查、可催、可撤。"""
+
+    id: str = Field(default_factory=lambda: uuid4().hex[:12])
+    title: str
+    creator: str
+    assignee: str
+    detail: str = ""
+    berth: str = ""
+    correlation_id: str = ""
+    status: TaskStatus = TaskStatus.CREATED
+    result: str = ""
+    deadline: str = ""  # ISO 时间，空=不限；超时未到终态由心跳扫尾自动标 failed
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class ContractPin(BaseModel):

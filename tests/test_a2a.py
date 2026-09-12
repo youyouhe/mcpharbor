@@ -402,6 +402,156 @@ def test_admin_manage_berth():
     print("✓ Admin 管理 Berth 测试通过\n")
 
 
+def test_message_ack():
+    print("=== 测试消息 ACK ===")
+    server, store = _setup()
+
+    a = _register(server, "boss", display_name="交办方", description="ack 测试交办方")
+    b = _register(server, "worker", display_name="受托方", description="ack 测试受托方")
+
+    def _send(**kw):
+        return json.loads(asyncio.run(server.send_message.fn(**kw)))
+
+    r = _send(from_agent="boss", token=a, to_agent="worker", message="请执行密钥轮换")
+    mid = r["results"][0]["message_id"]
+    r2 = _send(from_agent="boss", token=a, to_agent="worker", message="再查一下日志")
+    assert r2["status"] == "ok"
+
+    # 非 本人不能 ack
+    resp = json.loads(asyncio.run(server.ack_messages.fn(agent_id="boss", token=a, message_ids=[mid])))
+    assert resp["acked"] == 0  # 不是发给 boss 的
+    print("✓ 非收件人 ack 无效")
+
+    # worker ack
+    resp = json.loads(asyncio.run(server.ack_messages.fn(agent_id="worker", token=b, message_ids=[mid])))
+    assert resp["acked"] == 1
+    msg = store.get_message(mid)
+    assert msg.acked and msg.acked_at is not None
+    print("✓ 收件人 ack 成功，带时间戳")
+
+    # 发件方视角：谁认领了一目了然
+    msgs = store.get_messages("boss", with_agent="worker")
+    by_id = {m.id: m for m in msgs}
+    assert by_id[mid].acked is True
+    assert all(m.acked is False for i, m in by_id.items() if i != mid)
+    print("✓ 发件方可见 acked 状态（认领/未认领分明）")
+
+    # 重复 ack 幂等（第二次不再计数）
+    resp = json.loads(asyncio.run(server.ack_messages.fn(agent_id="worker", token=b, message_ids=[mid])))
+    assert resp["acked"] == 0
+    print("✓ 重复 ack 幂等")
+
+    store.close()
+    print("✓ 消息 ACK 测试通过\n")
+
+
+def test_task_state_machine():
+    print("=== 测试任务状态机 ===")
+    server, store = _setup()
+
+    boss = _register(server, "boss", display_name="交办方", description="状态机测试交办方")
+    worker = _register(server, "worker", display_name="受托方", description="状态机测试受托方")
+    outsider = _register(server, "outsider", display_name="路人", description="状态机测试旁观者")
+
+    def _task(name, **kw):
+        return json.loads(asyncio.run(getattr(server, name).fn(**kw)))
+
+    # 交办（带 deadline）
+    r = _task("create_task", creator="boss", token=boss, assignee="worker",
+              title="轮换 4A 密钥", detail="生成新密钥并回传验证结果",
+              deadline="2099-01-01T00:00")
+    assert r["status"] == "ok", r
+    tid = r["task_id"]
+    print(f"✓ create_task: #{tid} 已交办（deadline 2099）")
+
+    # 受托方收件箱里有交办通知（correlation_id=task_id 串线程）
+    msgs = store.get_messages("worker", unread_only=True)
+    assert any(m.correlation_id == tid for m in msgs)
+    print("✓ 交办通知落进受托方收件箱（串在线程上）")
+
+    # 非法 deadline 格式
+    r = _task("create_task", creator="boss", token=boss, assignee="worker", title="x", deadline="明天")
+    assert "error" in r
+    # 受托方不存在
+    r = _task("create_task", creator="boss", token=boss, assignee="ghost", title="x")
+    assert "error" in r
+    print("✓ 非法 deadline / 未注册受托方被拒绝")
+
+    # 交办方不能替受托方接单
+    r = _task("update_task", task_id=tid, agent_id="boss", token=boss, status="accepted")
+    assert "受托方" in r["error"]
+    # 跳步：created → working 不允许
+    r = _task("update_task", task_id=tid, agent_id="worker", token=worker, status="working")
+    assert "不允许" in r["error"]
+    print("✓ 交办方不能代接单；created→working 跳步被拒")
+
+    # 正常流转：accepted → working → input_required → working → completed
+    for st, note in [("accepted", "收到"), ("working", "开始换密钥"),
+                     ("input_required", "需要旧密钥的保管人确认"),
+                     ("working", "继续"), ("completed", "新密钥已生效，验证通过")]:
+        r = _task("update_task", task_id=tid, agent_id="worker", token=worker, status=st, note=note)
+        assert r["status"] == "ok" and r["task_status"] == st, (st, r)
+    print("✓ 全链路转移：accepted→working→input_required→working→completed")
+
+    task = store.get_task(tid)
+    assert task.result == "新密钥已生效，验证通过"
+    # 终态冻结
+    r = _task("update_task", task_id=tid, agent_id="worker", token=worker, status="working")
+    assert "终态" in r["error"]
+    r = _task("cancel_task", task_id=tid, agent_id="boss", token=boss)
+    assert "终态" in r["error"]
+    print("✓ result 已存；终态后冻结（update/cancel 都被拒）")
+
+    # 每次转移都给对方发了通知
+    conv = json.loads(server.get_conversations.fn(agent_id="boss", token=boss))
+    assert conv["count"] == 1  # 只有 worker 一个对话对象
+    assert conv["conversations"][0]["total"] >= 6
+    print("✓ 状态变化全程通知交办方（收件箱可追溯）")
+
+    # 取消：新任务由交办方取消；受托方不能取消
+    r = _task("create_task", creator="boss", token=boss, assignee="worker", title="取消试验")
+    tid2 = r["task_id"]
+    r = _task("cancel_task", task_id=tid2, agent_id="worker", token=worker)
+    assert "交办方" in r["error"]
+    r = _task("cancel_task", task_id=tid2, agent_id="boss", token=boss, reason="情况变了")
+    assert r["status"] == "ok" and r["task_status"] == "canceled"
+    print("✓ 受托方不能取消；交办方可取消")
+
+    # 拒单走 update_task(rejected)
+    r = _task("create_task", creator="boss", token=boss, assignee="worker", title="拒单试验")
+    tid3 = r["task_id"]
+    r = _task("update_task", task_id=tid3, agent_id="worker", token=worker, status="rejected", note="不在职责范围")
+    assert r["status"] == "ok" and r["task_status"] == "rejected"
+    print("✓ 拒单 rejected 走通")
+
+    # 旁观者不可见
+    r = json.loads(server.get_task.fn(task_id=tid, agent_id="outsider", token=outsider))
+    assert "当事方" in r["error"]
+    print("✓ 旁观者查任务被拒")
+
+    # get_task 带关联消息；list_tasks 过滤
+    r = json.loads(server.get_task.fn(task_id=tid, agent_id="worker", token=worker))
+    assert r["task"]["id"] == tid and len(r["related_messages"]) >= 1
+    r = json.loads(server.list_tasks.fn(agent_id="worker", token=worker, status="canceled"))
+    assert r["count"] == 1 and r["tasks"][0]["id"] == tid2
+    r = json.loads(server.list_tasks.fn(agent_id="boss", token=boss, role="creator"))
+    assert r["count"] == 3
+    print("✓ get_task 隐私+关联消息；list_tasks 按 status/role 过滤")
+
+    # 超时扫尾：deadline 已过的任务自动标 failed
+    r = _task("create_task", creator="boss", token=boss, assignee="worker", title="超时试验",
+              deadline="2000-01-01T00:00")
+    tid4 = r["task_id"]
+    swept = store.sweep_stale_tasks()
+    assert any(t.id == tid4 and t.status.value == "failed" for t in swept)
+    task = store.get_task(tid4)
+    assert "超时" in task.result
+    print("✓ 超时扫尾：过期任务自动 failed 并注明原因")
+
+    store.close()
+    print("✓ 任务状态机测试通过\n")
+
+
 if __name__ == "__main__":
     test_subscription_chain_e2e()
     test_reply_thread_and_conversations()
@@ -410,4 +560,6 @@ if __name__ == "__main__":
     test_contract_pins()
     test_admin_cleanup_and_purge()
     test_admin_manage_berth()
+    test_message_ack()
+    test_task_state_machine()
     print("🎉 A2A 补全测试全部通过。")
