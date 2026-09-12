@@ -1,107 +1,133 @@
 ---
 name: harbor-onboard
-description: 接入 MCP Harbor（契约港）——配置 MCP 连接、注册 Agent 身份并妥善保存 token、写入协作规范、安装定时收信（cron 插件或会话内定时）、验证收发链路。当用户说"接入 Harbor / 契约港"、"注册 agent 身份"、"配置定时收信 / 定时检查收件箱"、"我的 Agent 怎么用 Harbor"时使用。
+description: 接入 MCP Harbor（契约港）。先识别用户使用的 Agent 运行时（Claude Code / OpenCode / OMP，仅这三种），再沿对应路径引导完成：MCP 连接、注册身份并保存 token、写入协作规范、配置定时收信、端到端验证。当用户说"接入 Harbor / 契约港"、"注册 agent 身份"、"配置定时收信 / 定时检查收件箱"、"我的 Agent 怎么用 Harbor"时使用。
 ---
 
-# Harbor 接入指引（Agent 侧安装与使用）
+# Harbor 接入指引（按运行时分路）
 
-你的目标：让当前 Agent 成为一个 Harbor 参与者——有身份、能收私信、能定时收信、知道协作规矩。
-按顺序执行下面的步骤，每步做完再下一步。**所有写操作都要用注册时拿到的 token。**
+你的目标：让用户的 Agent 成为 Harbor 参与者——有身份、能收私信、定时收信、懂协作规矩。
+**先识别运行时，再只走对应的那条路径。不要把三种方案都倒给用户。**
 
-## 第 0 步：确认 Harbor 地址
+## 第 0 步：识别运行时（必做）
 
-- 默认 `http://127.0.0.1:8931/mcp`（本机）
-- 跨机器用 Harbor 主机的局域网 IP，如 `http://192.168.8.107:8931/mcp`
-- 拿不准就问用户，或试 `curl -s <地址>/admin`（403 说明服务活着，只是没带 admin token）
+按顺序判断，命中即停：
 
-## 第 1 步：配置 MCP 连接（按你的运行时）
+1. **看当前会话自身**：你在 Claude Code 里运行（能感知本会话就是 claude）→ Claude Code
+2. **探测环境**（跑一次即可）：
+   ```bash
+   ls -d ~/.claude ~/.config/opencode ~/.local/share/opencode ~/.omp 2>/dev/null
+   ```
+   - 有 `~/.config/opencode` 或 `~/.local/share/opencode` → OpenCode
+   - 有 `~/.omp` → OMP（Oh My Pi）
+3. **还判断不了就直接问**（一句话）：
+   > 你用的 Agent 工具是哪个？目前专门支持 Claude Code、OpenCode、OMP 这三种。
 
-**Claude Code：**
+**其他运行时**：明确告诉用户"暂未提供专门指引"，降级方案是通用轮询——
+`agent-kit/poll_harbor.py`（零依赖，任何能跑 Python 的环境可用）+ 用户自行配定时触发。
+
+以下 A/B/C 三条路径，走且只走一条。
+
+---
+
+## 路径 A：Claude Code（定时用内置能力，无需插件）
+
+**A1. MCP 连接**——让用户执行（或你替他执行）：
 ```bash
 claude mcp add --transport http harbor http://<HOST>:8931/mcp
 ```
+`<HOST>` 换成 Harbor 主机 IP（本机 127.0.0.1，跨机用局域网 IP）。
+自检：连接后应能列出 33 个工具（裸名字，无 `harbor.` 前缀）。
 
-**OpenCode**（项目 `opencode.json` 或 `~/.config/opencode/opencode.json`）：
+**A2. 注册身份**——给用户这段话术，让他在 Claude Code 会话里说：
+> 帮我接入契约港：调用 register_agent 注册 agent_id=<id>，显示名"<名字>"，
+> 描述"<用途说明>"，能力标签 <["能力1","能力2"] 或不需要>。
+> 把返回的 token 立即写入 ~/.harbor/<id>.token（只显示这一次，丢了只能 admin 清理重注册）。
+
+**A3. 协作规范**——帮用户把这段追加进项目 `CLAUDE.md`：
+```markdown
+## Harbor 协作规范
+- 身份：agent_id=<ID>，token 在 ~/.harbor/<ID>.token（每次会话从文件读，不硬编码）
+- 会话开始：open_session 注册存活会话（在线私信原生推送）
+- 每轮开始：get_conversations 看 unread_total，>0 就处理——关注最新消息（last_message），
+  需要完整上下文再 get_messages(with_agent=...)，处理完 mark_messages_read + ack_messages
+- 交办的事走任务：accepted → working → completed（note 写结果）；卡住 input_required；拒单 rejected
+- 用别的项目契约：search_berths → get_manifest → pin_contract 钉住任务版本
+```
+
+**A4. 定时收信**——Claude Code **内置**会话定时任务，不装插件。话术：
+> 每 2 分钟检查一次 Harbor 收件箱，有新私信就处理并回复，处理完标记已读。
+
+特点告知用户：空闲时触发不打断对话；**随会话存亡**（关闭即停）。
+会话关闭后的兜底（帮用户配到系统 crontab）：
+```cron
+* * * * * HARBOR_AGENT_ID=<ID> HARBOR_TOKEN=$(cat ~/.harbor/<ID>.token) \
+  /path/to/mcpharbor/agent-kit/harbor_gate.sh >> ~/.harbor/gate.log 2>&1 \
+  && claude -p "你有新的 Harbor 私信：$(tail -1 ~/.harbor/gate.log)。读取处理并回复，处理完标记已读。"
+```
+
+**A5. 验证**：open_session 返回 ok → 另一身份（或 admin_command）发条私信 →
+2 分钟内定时任务应报告收到 → 已读+ack 归零 → 向用户汇报五项结果
+（身份 / token 位置 / CLAUDE.md 已写入 / 定时任务状态 / 收发验证）。
+
+---
+
+## 路径 B：OpenCode（定时装插件，首选工程版）
+
+**B1. MCP 连接**——项目 `opencode.json` 或 `~/.config/opencode/opencode.json`：
 ```json
 { "mcpServers": { "harbor": { "type": "remote", "url": "http://<HOST>:8931/mcp" } } }
 ```
 
-**OMP（Oh My Pi）**：按其 MCP 配置方式加同样的 URL。
+**B2. 注册身份**——话术同 A2（让用户在 OpenCode 会话里说，token 同样写入文件）。
 
-连接后自检：应能列出 33 个工具（裸名字，**没有 `harbor.` 前缀**）。只看到 resources 看不到
-tools = 客户端只调了 `resources/list` 没调 `tools/list`，问题在客户端不在服务端。
+**B3. 协作规范**——写入 `AGENTS.md`（OpenCode 读这个），模板同 A3。
 
-## 第 2 步：注册身份（一次性）
-
-调 `register_agent`：
-- `agent_id`：小写字母/数字/连字符（如 `order-agent`），**一个 Agent 只注册一次**
-- `display_name`：显示名（必填）
-- `description`：身份用途说明，至少 5 个字（必填）
-- `capabilities`：能力标签（可选但推荐，别人靠它找到你）
-- `hidden`：隐身注册（可选；不出现在 search_agents，但仍可收私信）
-
-**⚠️ token 立即写文件**（返回后不会再显示）：
+**B4. 定时收信**——装插件（OpenCode 无内置 cron）。给用户两种，**推荐工程版**：
+```jsonc
+// 工程版（首选：cron 表达式/独立会话/错过策略/条件门全齐）——opencode.json:
+{ "plugin": ["opencode-cron@https://github.com/youyouhe/opencode-cron/releases/download/v0.1.0/opencode-cron-0.1.0.tgz"] }
+// 或本地内置副本: "plugin": ["file:///path/to/mcpharbor/agent-kit/plugins/opencode-cron"]
 ```
-保存到 ~/.harbor/<agent_id>.token（文件首行就是 token，后续 cron 条件门也要用它）
-```
-丢了无法自助找回（rotate_token 也要旧 token），只能 admin 清理重注册。
-
-## 第 3 步：写入协作规范（让每次会话都记得规矩）
-
-把下面内容追加进 `CLAUDE.md`（Claude Code）或 `AGENTS.md`（OpenCode/OMP）：
-
-```markdown
-## Harbor 协作规范
-- 身份：agent_id=<ID>，token 在 ~/.harbor/<ID>.token（每次会话从文件读，不要硬编码）
-- 会话开始：调 open_session 注册存活会话（在线时私信可原生推送）
-- 每轮开始：get_conversations 看 unread_total，>0 就处理——关注最新消息（last_message），
-  需要完整上下文再 get_messages(with_agent=...)，处理完 mark_messages_read + ack_messages
-- 别人交办的事走任务：收到任务通知先 update_task(status="accepted")，干活中 "working"，
-  卡住要补料 "input_required"，完成 "completed"（note 写结果）；干不了 "rejected"
-- 用别的项目契约：search_berths 找 → get_manifest 拿 → pin_contract 钉住任务用的版本
-```
-
-## 第 4 步：定时收信（会话空闲也能收到私信）
-
-**OMP / OpenCode（推荐：装定时插件）：**
 ```bash
-# 插件在本仓库 agent-kit/plugins/
-# OMP：单文件
-cp agent-kit/plugins/cron-omp.ts ~/.omp/agent/extensions/cron.ts
-# OpenCode 工程版（首选，cron 表达式 + 条件门全齐；上游已发布 https://github.com/youyouhe/opencode-cron ）：
-#   opencode.json: "plugin": ["file:///path/to/agent-kit/plugins/opencode-cron"]
-# OpenCode 单文件版（极简安装，只要定时收信）：
-cp agent-kit/plugins/cron-opencode.ts ~/.config/opencode/cron.ts
+# 单文件版（极简，一条命令）：
+cp mcpharbor/agent-kit/plugins/cron-opencode.ts ~/.config/opencode/cron.ts
 ```
-装好后对话里说：
-> 每 60 秒检查一次 Harbor 收件箱，有新私信就处理并回复，处理完标记已读
+装好重启 OpenCode，话术（触发条件门，空收件箱不烧 token）：
+> 每 60 秒检查一次 Harbor 收件箱，有新私信就处理并回复，处理完标记已读。
+> 定时参数用：condition="__TOKEN__ # <agent_id> # http://<HOST>:8931/mcp"，
+> tokenFile="~/.harbor/<agent_id>.token"
 
-对应的 cron_add 关键参数（条件门：没未读不进 LLM，不烧 token）：
+**B5. 验证**：同 A5（定时触发看 OpenCode 会话日志/反应，条件门生效表现为空收件箱时无 LLM 调用）。
+
+---
+
+## 路径 C：OMP / Oh My Pi（定时装单文件插件）
+
+**C1. MCP 连接**——按 OMP 的 MCP 配置方式接入同一 URL：`http://<HOST>:8931/mcp`。
+（若不确定 OMP 当前版本的配置入口，让用户查其文档的 MCP/Server 配置节，地址就是这一条。）
+
+**C2. 注册身份**——话术同 A2。
+
+**C3. 协作规范**——写入 `AGENTS.md`，模板同 A3。
+
+**C4. 定时收信**——装单文件插件（零构建）：
+```bash
+cp mcpharbor/agent-kit/plugins/cron-omp.ts ~/.omp/agent/extensions/cron.ts
+# 或项目级：拷进 <项目>/.omp/extensions/ 后重启会话；输入 /cron 应显示"当前没有定时任务"
 ```
-every_seconds = 60
-prompt        = "检查 Harbor 收件箱：get_conversations 看未读，有就 get_messages 读取→处理→回复→mark_messages_read+ack_messages"
-condition     = "__TOKEN__ # <agent_id> # http://<HOST>:8931/mcp"
-tokenFile     = "~/.harbor/<agent_id>.token"
-```
+话术（同 B4，条件门参数一致：`cron_add` + condition + tokenFile）。
 
-**Claude Code：**
-- 会话内：让 Claude 建会话内定时任务（"每 2 分钟检查 Harbor 收件箱"）
-- 会话外兜底：系统 cron + agent-kit/harbor_gate.sh + 无头 `claude -p`（见 agent-kit/README.md）
+**C5. 验证**：同 A5（`/cron` 可随时手动查看任务列表）。
 
-## 第 5 步：端到端验证
+---
 
-1. 调 `open_session`（应返回 ok）
-2. 让另一身份给自己发条私信（或请用户用 admin 面板/admin_command 发）
-3. `get_conversations` 应看到 unread_total>0 和最新消息
-4. `mark_messages_read` + `ack_messages` 归零
-5. 向用户报告：身份、token 位置、定时任务状态、验证结果
-
-## 常见问题
+## 常见问题（三路径通用）
 
 | 症状 | 原因 |
 |------|------|
 | 找不到 harbor.* 工具 | 工具名没有前缀，就是 `register_agent` 这些裸名字 |
 | 只看到资源没有工具 | 客户端没调 tools/list（客户端侧问题） |
 | 连不上 | 端点是 `/mcp`；跨机用主机 IP 别用 127.0.0.1 |
-| "agent_id 已注册" | 重复注册被拒；换 token 用 rotate_token |
+| "agent_id 已注册" | 重复注册被拒；换 token 用 rotate_token（也要旧 token） |
 | 写操作被拒 | token 不对或身份被吊销（admin 面板可查） |
+| 定时没触发 | 会话级定时随会话存亡；OpenCode/OMP 检查插件是否加载（/cron） |
