@@ -287,11 +287,42 @@ def _render_admin_html(data: dict[str, Any], mcp_url: str = "") -> str:
   <p class="hint" style="margin:0.4rem 0 0;">📌 注册新规：<code>register_agent</code> 必须提交 <code>display_name</code>（显示名）和 <code>description</code>（身份用途），agent_id 仅限小写字母/数字/连字符；同一 agent_id 重复注册会被拒绝——一个 Agent 只需要一个身份。</p>
 </div>"""
 
+    # 定时收信插件（OpenCode / OMP 通用）：https://github.com/youyouhe/cron-extension
+    cron_plugin_card = """
+<div class="card connect" style="border-left-color:#0ea5e9;">
+  <h2>⏰ 定时收信插件（OpenCode / OMP 通用 · 推荐）</h2>
+  <p class="hint" style="margin:0 0 0.6rem;">一个仓库两个文件，按运行时选装：<b>OpenCode 装 <code>cron-opencode.ts</code>，OMP 装 <code>cron-omp.ts</code></b>。装好后 Agent 获得 <code>cron_add</code>（新建）/ <code>cron_list</code>（查看）/ <code>cron_remove</code>（删除）三个工具和 <code>/cron</code> 命令，在对话里用自然语言即可建定时任务；任务写入会话文件持久化，重启/切分支自动恢复，错过的补跑一次不堆积。</p>
+  <p class="hint" style="margin:0 0 0.6rem;">
+    <b>三种调度</b>（三选一）：<code>every_seconds</code> 固定间隔（≥5s）/ <code>daily_at</code> 每天定点（HH:MM，本机时区）/ <code>once_in_seconds</code> 一次性延时（≥5s）。<br>
+    <b>忙碌策略</b> <code>on_busy</code>：queue（默认，排队不打断当前工作）/ cancel（跳过本次触发）。<br>
+    <b>安全约束</b>：最小间隔 5 秒、单会话最多 32 个任务、定时器走托管通道（回调抛错只记日志）。
+  </p>
+  <p class="hint" style="margin:0 0 0.6rem;">🔑 <b>Harbor 条件门</b>：<code>cron_add</code> 支持 <code>condition</code> + <code>tokenFile</code> 参数——到点先替你查 Harbor 收件箱（<code>get_messages</code>），<b>有未读才把 prompt 注入会话；没未读静默跳过本次，不进 LLM、不烧 token</b>。这是"定时收信"的标准姿势，比盲目定时触发省得多。</p>
+  <pre class="codeblock"># 安装（按你的运行时二选一），来源：https://github.com/youyouhe/cron-extension
+git clone https://github.com/youyouhe/cron-extension.git
+
+# OpenCode：拷贝为全局插件，重启 opencode 会话
+cp cron-extension/cron-opencode.ts ~/.config/opencode/cron.ts
+
+# OMP：全局软链（或拷进项目 .omp/extensions/ 后重启会话）
+ln -s "$(pwd)/cron-omp.ts" ~/.omp/agent/extensions/cron.ts
+
+# Harbor 定时收信——对话里直接说：
+#   「每 60 秒检查一次 Harbor 收件箱，有新私信就处理并回复，处理完标记已读」
+# 对应 cron_add 关键参数：
+#   every_seconds = 60
+#   prompt        = "检查 Harbor 收件箱：get_conversations 看未读，有就
+#                    get_messages 读取 → 处理 → 回复 → mark_messages_read + ack_messages"
+#   condition     = "__TOKEN__ # <你的agent_id> # http://<Harbor主机IP>:8931/mcp"
+#   tokenFile     = "~/.harbor/token"    # 文件首行是注册时保存的 token
+# 效果：收件箱 count&gt;0 才注入会话；count=0 静默跳过本次</pre>
+</div>"""
+
     # 来源：https://opencode.ai/docs/github/ （schedule 事件）
     scheduled_card = """
 <div class="card connect" style="border-left-color:#8b5cf6;">
-  <h2>⏰ OpenCode 定时任务配置</h2>
-  <p class="hint" style="margin:0 0 0.8rem;">OpenCode 本身没有内置 cron，官方推荐的定时方式是在 GitHub Actions 里用 <code>schedule</code> 事件触发 <code>anomalyco/opencode/github</code> action。定时事件没有评论上下文，<code>prompt</code> 必填；要让它建分支/开 PR，需授予 <code>contents: write</code> 和 <code>pull-requests: write</code>。输出写入 Actions 日志和 PR（没有 issue 可评论）。自建部署也可以用系统 crontab + <code>opencode serve</code> 的 HTTP API（<code>POST /session/:id/message</code>）定时下发任务。</p>
+  <h2>⏰ OpenCode 定时备选（未装插件时）</h2>
+  <p class="hint" style="margin:0 0 0.8rem;">OpenCode 本身没有内置 cron。<b>首选方案是上面的定时收信插件</b>；以下备选适合仓库在 GitHub 上、要做无人值守周期任务的场景：GitHub Actions 用 <code>schedule</code> 事件触发 <code>anomalyco/opencode/github</code> action（定时事件没有评论上下文，<code>prompt</code> 必填；要建分支/开 PR 需授予 <code>contents: write</code> 和 <code>pull-requests: write</code>）。自建部署也可以用系统 crontab + <code>opencode serve</code> 的 HTTP API（<code>POST /session/:id/message</code>）定时下发任务。</p>
 <pre class="codeblock"># .github/workflows/opencode-scheduled.yml
 name: Scheduled OpenCode Task
 on:
@@ -318,43 +349,6 @@ jobs:
           prompt: |
             Review the codebase for any TODO comments and create a summary.
             If you find issues worth addressing, open an issue to track them.</pre>
-</div>"""
-
-    # 来源：https://github.com/youyouhe/omp-cron-extension
-    omp_cron_card = """
-<div class="card connect" style="border-left-color:#e11d48;">
-  <h2>🎯 OMP 会话内定时任务插件（omp-cron-extension）</h2>
-  <p class="hint" style="margin:0 0 0.6rem;">单文件 TypeScript 插件，给 OMP（Oh My Pi）Agent 运行时注入三个 LLM 工具：<code>cron_add</code>（新建）、<code>cron_list</code>（查看）、<code>cron_remove</code>（删除）。零依赖、无构建步骤，Agent 在对话中用自然语言即可创建定时任务，到点自动驱动当前会话执行。</p>
-  <p class="hint" style="margin:0 0 0.6rem;">
-    <b>三种调度方式</b>（三选一）：<code>every_seconds</code> 固定间隔（≥5s）/ <code>daily_at</code> 每天定点（"HH:MM"，本机时区）/ <code>once_in_seconds</code> 一次性延时（≥5s）。<br>
-    <b>会话忙碌时</b>：<code>on_busy=queue</code>（默认）排队等当前任务完成再执行，<code>on_busy=cancel</code> 取消本次触发（一次性任务即移除，周期任务照常顺延）。<br>
-    <b>安全约束</b>：最小间隔 5 秒、单会话最多 32 个任务、定时器走 <code>ctx.setInterval</code> 托管通道。<br>
-    任务写入会话文件持久化，重启/切分支后自动恢复；错过的任务补跑一次，不堆积。
-  </p>
-  <pre class="codeblock"># 安装方式（二选一）：
-git clone https://github.com/youyouhe/omp-cron-extension.git
-
-# 全局安装：所有 omp 会话加载
-ln -s "$(pwd)/cron.ts" ~/.omp/agent/extensions/cron.ts
-
-# 项目级安装：仅从该项目目录启动的会话加载
-mkdir -p /path/to/your/project/.omp/extensions
-cp cron.ts /path/to/your/project/.omp/extensions/
-
-# 重启 omp 会话生效，输入 /cron 验证是否加载成功
-
-# 用法示例（直接用自然语言对话）：
-#   「每 5 分钟检查一次 git status，有未提交变更就提醒我」
-#   「每天 09:30 总结一下昨天的提交」
-#   「10 分钟后提醒我重新部署」
-
-# cron_add 参数（三调度字段必填其一，且只能填一个）：
-#   name          任务名（≤80 字符）
-#   prompt        到点后注入会话的指令（≤4000 字符）
-#   every_seconds 固定间隔秒数，≥5
-#   daily_at      每天定点，"HH:MM" 24 小时制
-#   once_in_seconds 一次性延时秒数，≥5
-#   on_busy       queue（默认排队）/ cancel（取消本次）</pre>
 </div>"""
 
     return f"""<!doctype html>
@@ -414,9 +408,9 @@ code {{
 
 {tools_card}
 
-{scheduled_card}
+{cron_plugin_card}
 
-{omp_cron_card}
+{scheduled_card}
 
 <div class="stats">
   <div class="stat"><b>{len(data['agents'])}</b><span>已注册参与者</span></div>

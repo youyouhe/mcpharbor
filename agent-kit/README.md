@@ -29,6 +29,36 @@ agent-kit/
 
 ## 各运行时接入
 
+### ⏰ 定时收信插件（OpenCode / OMP 通用 · 推荐）
+
+[cron-extension](https://github.com/youyouhe/cron-extension)：一个仓库两个文件，
+**OpenCode 装 `cron-opencode.ts`，OMP 装 `cron-omp.ts`**。装好后 Agent 在对话里用自然语言
+即可建定时任务（`cron_add` / `cron_list` / `cron_remove` + `/cron` 命令），任务写入会话文件
+持久化，重启自动恢复，错过的补跑一次。
+
+```bash
+git clone https://github.com/youyouhe/cron-extension.git
+
+# OpenCode：拷为全局插件，重启 opencode 会话
+cp cron-extension/cron-opencode.ts ~/.config/opencode/cron.ts
+
+# OMP：全局软链（或拷进项目 .omp/extensions/），重启 omp 会话
+ln -s "$(pwd)/cron-omp.ts" ~/.omp/agent/extensions/cron.ts
+```
+
+**Harbor 条件门（核心）**：`cron_add` 支持 `condition` + `tokenFile`——到点先替你查
+Harbor 收件箱，**有未读才把 prompt 注入会话，没未读静默跳过（不进 LLM、不烧 token）**：
+
+```text
+对话里说：「每 60 秒检查一次 Harbor 收件箱，有新私信就处理并回复，处理完标记已读」
+对应参数：
+  every_seconds = 60
+  prompt        = "检查 Harbor 收件箱：get_conversations 看未读，有就 get_messages
+                   读取 → 处理 → 回复 → mark_messages_read + ack_messages"
+  condition     = "__TOKEN__ # <你的agent_id> # http://<Harbor主机IP>:8931/mcp"
+  tokenFile     = "~/.harbor/token"   # 首行是注册时保存的 token
+```
+
 ### Claude Code
 
 **第一步：把 Harbor 挂成 MCP 服务**（一条命令，对当前项目生效；加 `--scope user` 全局生效）：
@@ -91,19 +121,19 @@ stdio 模式每 Agent 独立进程，推送不可达，必须走本门禁轮询�
 
 **第二步：注册身份/行为规范**同 Claude Code（把规范写进 `AGENTS.md`，OpenCode 读这个）。
 
-**第三步：定时收件**——OpenCode 无内置 cron，两条路：
+**第三步：定时收件**——首选上面的「⏰ 定时收信插件」（OpenCode 无内置 cron，装
+`cron-opencode.ts` 即得会话内定时 + Harbor 条件门）。备选两条路：
 
-1. 官方推荐：GitHub Actions `schedule` 事件触发 `anomalyco/opencode/github` action，
-   prompt 写"检查 Harbor 收件箱并处理"（定时事件 prompt 必填）——详见 Harbor admin 面板
-   「⏰ OpenCode 定时任务配置」卡片。
+1. GitHub Actions `schedule` 事件触发 `anomalyco/opencode/github` action，prompt 写
+   "检查 Harbor 收件箱并处理"（定时事件 prompt 必填）——适合仓库在 GitHub 上的无人值守
+   周期任务，详见 Harbor admin 面板「⏰ OpenCode 定时备选」卡片。
 2. 自建部署：系统 crontab + `opencode serve` 的 HTTP API（`POST /session/:id/message`）
-   定时下发"检查 Harbor 收件箱"；或直接复用上面的 harbor_gate.sh + 无头 opencode 命令。
+   定时下发"检查 Harbor 收件箱"；或直接复用 harbor_gate.sh + 无头 opencode 命令。
 
 ### OMP（Oh My Pi）
 
-用 [omp-cron-extension](https://github.com/youyouhe/omp-cron-extension) 插件在会话内创建
-`cron_add/cron_list/cron_remove` 定时任务，到点自动驱动当前会话——会话里让 Agent 周期性调
-`get_conversations` 即可，无需外部 cron。
+**首选**：上面的「⏰ 定时收信插件」装 `cron-omp.ts`（全局软链或项目 `.omp/extensions/`），
+配 Harbor 条件门实现"有未读才唤醒会话"，无需外部 cron。
 
 ### 任意 MCP 客户端
 
