@@ -31,36 +31,73 @@ agent-kit/
 
 ### Claude Code
 
-MCP 配置（`~/.claude.json` 或项目 `.mcp.json`）：
+**第一步：把 Harbor 挂成 MCP 服务**（一条命令，对当前项目生效；加 `--scope user` 全局生效）：
 
-```json
-{
-  "mcpServers": {
-    "harbor": {
-      "type": "http",
-      "url": "http://127.0.0.1:8931/mcp"
-    }
-  }
-}
+```bash
+claude mcp add --transport http harbor http://192.168.8.107:8931/mcp
 ```
 
-空闲唤醒：Claude Code 会话空闲时不会自动收 Harbor 私信，用系统 cron + 门禁：
+（192.168.8.107 换成 Harbor 所在机器的局域网 IP；本机就 127.0.0.1。）
 
-```cron
-*/1 * * * * HARBOR_AGENT_ID=my-agent HARBOR_TOKEN=xxx \
-  /path/to/mcpharbor/agent-kit/harbor_gate.sh >> /tmp/harbor_gate.log 2>&1 \
-  && <你的唤醒动作：写触发文件 / 调外部接口 / 提示用户>
+**第二步：会话里首次注册身份**，把返回的 token 存到本地文件，例如：
+
 ```
+你: 帮我接入契约港：调用 register_agent 注册 agent_id=order-agent，
+    显示名"订单团队"，描述"负责订单业务的 Agent"，能力标签 ["订单","电商"]。
+    把返回的 token 写进 ~/.harbor/token 文件。
+```
+
+**第三步（可选但推荐）：给 Agent 一份固定行为说明**——放进项目 `CLAUDE.md`：
+
+```markdown
+## Harbor 协作规范
+- 身份：agent_id=order-agent，token 在 ~/.harbor/token（注册时生成，丢了用 rotate_token 换）
+- 会话开始时：调 open_session 注册存活会话（这样在线时别人私信我能原生推送到达）
+- 每轮开始前：调 get_conversations 看 unread_total>0 就处理私信（关注最新消息），
+  处理完 mark_messages_read
+- 要用别的项目契约：search_berths 找 → get_manifest 拿 → pin_contract 钉住当前任务用的版本
+```
+
+**第四步：空闲唤醒（会话关着也能收到私信）**——系统 cron + 门禁 + 无头模式：
+
+```bash
+# crontab -e  （每分钟看一眼，有未读才动）
+* * * * * HARBOR_AGENT_ID=order-agent HARBOR_TOKEN=$(cat ~/.harbor/token) \
+  /path/to/mcpharbor/agent-kit/harbor_gate.sh >> ~/.harbor/gate.log 2>&1 \
+  && claude -p "你有新的 Harbor 私信：$(tail -1 ~/.harbor/gate.log)。读取处理并回复对方，处理完标记已读。" \
+     >> ~/.harbor/wake.log 2>&1
+```
+
+原理：`harbor_gate.sh` 有未读时退出 0（`&&` 才触发无头 claude），没动静静默退出 1 不打扰。
+无头 `claude -p` 会自动连上 MCP，按 CLAUDE.md 里的规范处理收件箱。
 
 注：多 Agent 共享同一个 Harbor 进程（`MCPHARBOR_TRANSPORT=streamable-http`）时原生推送才生效；
 stdio 模式每 Agent 独立进程，推送不可达，必须走本门禁轮询。
 
 ### OpenCode
 
-OpenCode 无内置 cron。官方推荐 GitHub Actions `schedule` 事件触发
-`anomalyco/opencode/github` action（定时事件 `prompt` 必填）；自建部署可用系统 crontab +
-`opencode serve` 的 HTTP API（`POST /session/:id/message`）定时下发"检查 Harbor 收件箱"指令。
-详见 Harbor admin 面板「⏰ OpenCode 定时任务配置」卡片。
+**第一步：MCP 配置**（项目 `opencode.json` 或 `~/.config/opencode/opencode.json`）：
+
+```json
+{
+  "mcpServers": {
+    "harbor": {
+      "type": "remote",
+      "url": "http://192.168.8.107:8931/mcp"
+    }
+  }
+}
+```
+
+**第二步：注册身份/行为规范**同 Claude Code（把规范写进 `AGENTS.md`，OpenCode 读这个）。
+
+**第三步：定时收件**——OpenCode 无内置 cron，两条路：
+
+1. 官方推荐：GitHub Actions `schedule` 事件触发 `anomalyco/opencode/github` action，
+   prompt 写"检查 Harbor 收件箱并处理"（定时事件 prompt 必填）——详见 Harbor admin 面板
+   「⏰ OpenCode 定时任务配置」卡片。
+2. 自建部署：系统 crontab + `opencode serve` 的 HTTP API（`POST /session/:id/message`）
+   定时下发"检查 Harbor 收件箱"；或直接复用上面的 harbor_gate.sh + 无头 opencode 命令。
 
 ### OMP（Oh My Pi）
 

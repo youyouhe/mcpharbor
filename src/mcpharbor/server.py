@@ -243,12 +243,12 @@ def _render_admin_html(data: dict[str, Any], mcp_url: str = "") -> str:
     tools_card = """
 <div class="card connect" style="border-left-color:#16a34a;">
   <h2>🧰 工具清单与"没有工具"排查</h2>
-  <p class="hint" style="margin:0 0 0.6rem;">Harbor 共 <b>26 个工具</b>，实际暴露的工具名<b>不带 <code>harbor.</code> 前缀</b>（README 里的 <code>harbor.xxx</code> 只是文档写法）：<code>register_agent</code>、<code>rotate_token</code>、<code>publish_manifest</code>、<code>get_manifest</code>、<code>search_berths</code>、<code>subscribe</code>、<code>open_session</code>、<code>send_message</code>、<code>get_messages</code>、<code>mark_messages_read</code>、<code>get_conversations</code>、<code>search_agents</code>、<code>admin_command</code>、<code>admin_manage_agent</code>、<code>admin_cleanup</code>、<code>notify</code>、<code>resolve_dependency</code>、<code>check_compat</code>、<code>pin_contract</code>、<code>unpin_contract</code>、<code>get_my_pins</code>、<code>check_updates</code>、<code>sync</code>、<code>diff_versions</code>、<code>get_notifications</code>、<code>get_audit_log</code>。</p>
+  <p class="hint" style="margin:0 0 0.6rem;">Harbor 共 <b>27 个工具</b>，实际暴露的工具名<b>不带 <code>harbor.</code> 前缀</b>（README 里的 <code>harbor.xxx</code> 只是文档写法）：<code>register_agent</code>、<code>rotate_token</code>、<code>publish_manifest</code>、<code>get_manifest</code>、<code>search_berths</code>、<code>subscribe</code>、<code>open_session</code>、<code>send_message</code>、<code>get_messages</code>、<code>mark_messages_read</code>、<code>get_conversations</code>、<code>search_agents</code>、<code>admin_command</code>、<code>admin_manage_agent</code>、<code>admin_manage_berth</code>、<code>admin_cleanup</code>、<code>notify</code>、<code>resolve_dependency</code>、<code>check_compat</code>、<code>pin_contract</code>、<code>unpin_contract</code>、<code>get_my_pins</code>、<code>check_updates</code>、<code>sync</code>、<code>diff_versions</code>、<code>get_notifications</code>、<code>get_audit_log</code>。</p>
   <p class="hint" style="margin:0;">如果某个 Agent 连上后说"只看到资源、没有工具"，问题几乎都在客户端侧，按概率排查：
     ① 客户端 MCP 实现残缺——不少网页聊天 Agent 只调 <code>resources/list</code> 不调 <code>tools/list</code>，能看到 <code>harbor://berths</code> 说明连接是通的；
     ② 按 <code>harbor.*</code> 前缀找工具——实际是裸名字；
     ③ transport/端点不匹配——streamable-http 端点是 <code>/mcp</code>，有的客户端只连 <code>/sse</code>。
-    服务端自检：用 fastmcp Client 连上来跑 <code>list_tools()</code>，能看到 26 个工具就说明问题在对方。</p>
+    服务端自检：用 fastmcp Client 连上来跑 <code>list_tools()</code>，能看到 27 个工具就说明问题在对方。</p>
   <p class="hint" style="margin:0.4rem 0 0;">📌 注册新规：<code>register_agent</code> 必须提交 <code>display_name</code>（显示名）和 <code>description</code>（身份用途），agent_id 仅限小写字母/数字/连字符；同一 agent_id 重复注册会被拒绝——一个 Agent 只需要一个身份。</p>
 </div>"""
 
@@ -1056,7 +1056,7 @@ def admin_manage_agent(admin_token: str, agent_id: str, action: str) -> str:
 
     - "revoke"：吊销——token 立即失效、踢下线，但注册记录保留可追溯（推荐先用这个）。
     - "purge"：彻底删除——连注册记录、它的全部订阅、收发的私信、契约钉一起删掉，不可恢复。
-      若该 agent 还拥有 berth（发布了项目卡），会被拒绝，需先处理 berth。
+      若该 agent 还拥有 berth（发布了项目卡），会被拒绝，需先用 admin_manage_berth 处理。
 
     识别僵尸的依据（admin 面板可看）：display_name/description 为"未登记"（新规前注册）、
     last_seen 为空或很久以前、长期离线。重复注册的垃圾身份（如同一 Agent 注册了多个名字）
@@ -1086,8 +1086,8 @@ def admin_manage_agent(admin_token: str, agent_id: str, action: str) -> str:
     if owned:
         return json.dumps({
             "error": f"agent_id={agent_id} 名下还有 berth：{owned}。"
-                     f"请先让 owner 转移或下架这些 berth（或用 admin 直接处理），再 purge，"
-                     f"否则这些项目卡会变成无主状态。",
+                     f"请先用 admin_manage_berth 处理（deactivate 下架保留历史 / delete 彻底删除），"
+                     f"再 purge，否则这些项目卡会变成无主状态。",
         }, ensure_ascii=False)
 
     removed_subs, removed_msgs = store.purge_agent(agent_id)
@@ -1101,6 +1101,56 @@ def admin_manage_agent(admin_token: str, agent_id: str, action: str) -> str:
         "removed_messages": removed_msgs,
         "message": (f"已彻底删除 {agent_id} 的注册记录"
                     f"（连带清理 {removed_subs} 条订阅、{removed_msgs} 条私信）。"),
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+def admin_manage_berth(admin_token: str, berth: str, action: str) -> str:
+    """admin 管理某个 Berth（项目卡）。action 三选一：
+
+    - "deactivate"：下架——berth 从搜索/发现里消失（inactive），全部版本历史保留，可恢复。
+      适用于项目停运但还要留契约追溯的场景。
+    - "activate"：重新上架——deactivate 的逆操作。
+    - "delete"：彻底删除——连 berth 本体、全部 Manifest/Contract 版本、订阅、契约钉一起删，
+      不可恢复。只想临时下架用 deactivate。删完 owner 名下无 berth，admin_manage_agent
+      的 purge 也就不再被拦。
+    """
+    err = _check_admin(admin_token)
+    if err:
+        return json.dumps({"error": err}, ensure_ascii=False)
+    if action not in ("deactivate", "activate", "delete"):
+        return json.dumps({
+            "error": "action 只能是 deactivate（下架）/ activate（重新上架）/ delete（彻底删除）",
+        }, ensure_ascii=False)
+
+    store = _get_store()
+    if store.get_berth(berth) is None:
+        return json.dumps({"error": f"berth={berth} 不存在"}, ensure_ascii=False)
+
+    if action == "deactivate":
+        store.deactivate_berth(berth)
+        _audit("admin.berth_deactivate", "admin", f"berth:{berth}", {})
+        return json.dumps({
+            "status": "ok", "action": action, "berth": berth,
+            "message": f"已下架 berth={berth}（版本历史保留，action=activate 可恢复）。",
+        }, ensure_ascii=False)
+
+    if action == "activate":
+        store.activate_berth(berth)
+        _audit("admin.berth_activate", "admin", f"berth:{berth}", {})
+        return json.dumps({
+            "status": "ok", "action": action, "berth": berth,
+            "message": f"已重新上架 berth={berth}。",
+        }, ensure_ascii=False)
+
+    counts = store.delete_berth(berth)
+    _audit("admin.berth_delete", "admin", f"berth:{berth}", counts)
+    return json.dumps({
+        "status": "ok", "action": "delete", "berth": berth,
+        "removed": counts,
+        "message": (f"已彻底删除 berth={berth}：连带 {counts['manifests']} 个 Manifest 版本、"
+                    f"{counts['contracts']} 个 Contract、{counts['subscriptions']} 条订阅、"
+                    f"{counts['pins']} 个契约钉。"),
     }, ensure_ascii=False)
 
 

@@ -352,6 +352,56 @@ def test_admin_cleanup_and_purge():
     print("✓ 数据保养与彻底删除测试通过\n")
 
 
+def test_admin_manage_berth():
+    print("=== 测试 Admin 管理 Berth ===")
+    server, store = _setup()
+    os.environ["MCPHARBOR_ADMIN_TOKEN"] = "t-admin"
+
+    owner = _register(server, "berth-owner", display_name="项目方", description="berth 管理测试身份")
+    _publish(server, "berth-owner", owner, "legacy-api", "1.0.0", capabilities=["legacy"])
+    _publish(server, "berth-owner", owner, "legacy-api", "1.1.0", capabilities=["legacy"])
+    consumer = _register(server, "legacy-user", display_name="使用方", description="berth 管理测试消费方")
+    json.loads(server.subscribe.fn(subscriber="legacy-user", token=consumer, berth="legacy-api"))
+    json.loads(server.pin_contract.fn(agent_id="legacy-user", token=consumer,
+                                      berth="legacy-api", version="1.0.0"))
+
+    # 非法 action / 错误 token / 不存在的 berth
+    assert "error" in json.loads(server.admin_manage_berth.fn(admin_token="t-admin", berth="legacy-api", action="nuke"))
+    assert "error" in json.loads(server.admin_manage_berth.fn(admin_token="wrong", berth="legacy-api", action="deactivate"))
+    assert "error" in json.loads(server.admin_manage_berth.fn(admin_token="t-admin", berth="ghost", action="deactivate"))
+    print("✓ 非法 action / 错误 token / 不存在 berth 均被拒绝")
+
+    # 下架：从发现消失，但版本历史保留
+    resp = json.loads(server.admin_manage_berth.fn(admin_token="t-admin", berth="legacy-api", action="deactivate"))
+    assert resp["status"] == "ok"
+    found = json.loads(server.search_berths.fn(keyword="legacy"))
+    assert found["count"] == 0
+    assert store.get_manifest("legacy-api", "1.0.0") is not None  # 历史还在
+    print("✓ deactivate: 搜索消失、版本历史保留")
+
+    # 重新上架：恢复可见
+    resp = json.loads(server.admin_manage_berth.fn(admin_token="t-admin", berth="legacy-api", action="activate"))
+    assert resp["status"] == "ok"
+    found = json.loads(server.search_berths.fn(keyword="legacy"))
+    assert found["count"] == 1
+    print("✓ activate: 重新上架恢复可见")
+
+    # 有 berth 的 owner 不能被 purge，delete 后解锁
+    resp = json.loads(server.admin_manage_agent.fn(admin_token="t-admin", agent_id="berth-owner", action="purge"))
+    assert "error" in resp and "admin_manage_berth" in resp["error"]
+    resp = json.loads(server.admin_manage_berth.fn(admin_token="t-admin", berth="legacy-api", action="delete"))
+    assert resp["status"] == "ok"
+    assert resp["removed"]["manifests"] == 2 and resp["removed"]["subscriptions"] == 1 and resp["removed"]["pins"] == 1
+    resp = json.loads(server.admin_manage_agent.fn(admin_token="t-admin", agent_id="berth-owner", action="purge"))
+    assert resp["status"] == "ok", resp
+    print("✓ delete 连带清版本/订阅/契约钉，purge 随之解锁")
+
+    assert store.get_berth("legacy-api") is None
+    os.environ.pop("MCPHARBOR_ADMIN_TOKEN", None)
+    store.close()
+    print("✓ Admin 管理 Berth 测试通过\n")
+
+
 if __name__ == "__main__":
     test_subscription_chain_e2e()
     test_reply_thread_and_conversations()
@@ -359,4 +409,5 @@ if __name__ == "__main__":
     test_search_agents_and_hidden()
     test_contract_pins()
     test_admin_cleanup_and_purge()
+    test_admin_manage_berth()
     print("🎉 A2A 补全测试全部通过。")

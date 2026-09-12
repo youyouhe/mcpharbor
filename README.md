@@ -54,7 +54,8 @@ MCPHARBOR_TRANSPORT=streamable-http MCPHARBOR_ADMIN_TOKEN=<自己定的密钥> m
 | `harbor.get_notifications` | 查询通知历史（仅 admin，需要 `admin_token`） |
 | `harbor.get_audit_log` | 查询审计日志（仅 admin，需要 `admin_token`） |
 | `harbor.admin_command` | admin 向某个 agent 下一句指令，不跟踪执行状态（仅 admin） |
-| `harbor.admin_manage_agent` | admin 清理废弃注册：`action=revoke` 吊销（token 失效、记录保留）/ `action=purge` 彻底删除（连带清订阅、私信、契约钉；名下有 berth 时拒绝） |
+| `harbor.admin_manage_agent` | admin 清理废弃注册：`action=revoke` 吊销（token 失效、记录保留）/ `action=purge` 彻底删除（连带清订阅、私信、契约钉；名下有 berth 时先用 admin_manage_berth 处理） |
+| `harbor.admin_manage_berth` | admin 管理 Berth：`action=deactivate` 下架（从发现里消失、历史保留、可恢复）/ `action=activate` 重新上架 / `action=delete` 彻底删除（连带全部版本、订阅、契约钉，不可恢复） |
 | `harbor.admin_cleanup` | admin 数据保养：按保留期清理过期私信/通知（仅 admin） |
 
 ## MCP Resources

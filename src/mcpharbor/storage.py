@@ -225,6 +225,37 @@ class HarborStorage:
         conn.commit()
         return cur.rowcount > 0
 
+    def activate_berth(self, berth_id: str) -> bool:
+        """恢复被下架的 berth（deactivate 的逆操作）。"""
+        conn = self._get_conn()
+        cur = conn.execute(
+            "UPDATE berths SET status='active', updated_at=? WHERE id=?",
+            (datetime.now(timezone.utc).isoformat(), berth_id)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+    def delete_berth(self, berth_id: str) -> dict[str, int]:
+        """彻底删除 berth 及其全部 manifests/contracts/订阅/契约钉，返回各类删除计数。"""
+        conn = self._get_conn()
+        counts = {
+            "manifests": conn.execute(
+                "SELECT COUNT(*) AS n FROM manifests WHERE berth=?", (berth_id,)).fetchone()["n"],
+            "contracts": conn.execute(
+                "SELECT COUNT(*) AS n FROM contracts WHERE berth=?", (berth_id,)).fetchone()["n"],
+            "subscriptions": conn.execute(
+                "SELECT COUNT(*) AS n FROM subscriptions WHERE berth=?", (berth_id,)).fetchone()["n"],
+            "pins": conn.execute(
+                "SELECT COUNT(*) AS n FROM contract_pins WHERE berth=?", (berth_id,)).fetchone()["n"],
+        }
+        conn.execute("DELETE FROM manifests WHERE berth=?", (berth_id,))
+        conn.execute("DELETE FROM contracts WHERE berth=?", (berth_id,))
+        conn.execute("DELETE FROM subscriptions WHERE berth=?", (berth_id,))
+        conn.execute("DELETE FROM contract_pins WHERE berth=?", (berth_id,))
+        conn.execute("DELETE FROM berths WHERE id=?", (berth_id,))
+        conn.commit()
+        return counts
+
     def list_all_berths(self) -> list[Berth]:
         """管理视角：不管状态，返回全部 berth（含 inactive/deprecated）。"""
         conn = self._get_conn()
