@@ -837,7 +837,14 @@ class HarborStorage:
             datetime.now(timezone.utc).isoformat(),
         ))
         conn.commit()
-        return ContractPin(agent_id=agent_id, berth=berth, version=version, task_id=task_id)
+        # 重复钉时 INSERT 的 id 会被 ON CONFLICT 忽略（保留原 id）；重新查一次，
+        # 保证返回对象的 id 和实际落库的一致，不是 INSERT 语句里临时生成的那个。
+        row = conn.execute(
+            "SELECT * FROM contract_pins WHERE agent_id=? AND berth=? AND task_id=?",
+            (agent_id, berth, task_id),
+        ).fetchone()
+        return ContractPin(id=row["id"], agent_id=agent_id, berth=berth, version=version,
+                           task_id=task_id, created_at=datetime.fromisoformat(row["created_at"]))
 
     def unpin_contract(self, agent_id: str, berth: str, task_id: str = "") -> bool:
         conn = self._get_conn()

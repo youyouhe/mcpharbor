@@ -133,6 +133,17 @@ async def _push_notification(recipient: str, resource_uri: str, **extra: Any) ->
         return False
 
 
+def _check_recipient(store: HarborStorage, agent_id: str) -> str | None:
+    """校验目标 agent_id 能否作为消息/任务的接收方。未注册或已吊销都返回错误——
+    已吊销的身份永远登录不了（_check_auth 会拒绝），发给它等于消息进了死信箱。"""
+    token = store.get_agent_token(agent_id)
+    if token is None:
+        return f"agent_id={agent_id} 未注册"
+    if token.revoked:
+        return f"agent_id={agent_id} 已被吊销，无法收发（对方已无法登录读取）"
+    return None
+
+
 def _check_auth(agent_id: str, token: str) -> str | None:
     """校验 agent_id 与 token 是否匹配。返回错误信息，通过则返回 None。"""
     store = _get_store()
@@ -623,11 +634,17 @@ def register_agent(
         }, ensure_ascii=False)
 
     token = _generate_token()
-    store.create_agent_token(
+    created = store.create_agent_token(
         agent_id, _hash_token(token),
         display_name=display_name, description=description,
         contact=contact.strip(), capabilities=capabilities or [], hidden=hidden,
     )
+    if not created:
+        # 竞态：两个并发请求都通过了上面的"未注册"检查，数据库层唯一约束拦住了后来者。
+        # 不能假装成功——那样对方会拿着一个从未持久化的 token，之后所有写操作都会失败。
+        return json.dumps({
+            "error": f"agent_id={agent_id} 刚被其他请求抢先注册，请换个 agent_id 或稍后用 rotate_token（需要对方的 token）",
+        }, ensure_ascii=False)
     _audit("agent.register", agent_id, f"agent:{agent_id}", {
         "display_name": display_name, "description": description,
         "contact": contact.strip(), "capabilities": capabilities or [],
@@ -694,6 +711,15 @@ async def publish_manifest(
         _audit("auth.denied", owner, f"berth:{berth}", {"reason": auth_err})
         return json.dumps({"error": auth_err}, ensure_ascii=False)
 
+    # 先做完全部校验再落库：errors 的 key 必须是数字错误码，不然半途抛异常会
+    # 留下"berth 已经指向新版本号、但 manifest 数据从未写入"的脏状态。
+    try:
+        int_errors = {int(k): v for k, v in (errors or {}).items()}
+    except (TypeError, ValueError):
+        return json.dumps({
+            "error": f"errors 的 key 必须是数字错误码（如 \"401\"），收到：{list((errors or {}).keys())}",
+        }, ensure_ascii=False)
+
     old_manifest = store.get_manifest(berth)
     berth_obj = store.get_berth(berth)
 
@@ -711,7 +737,6 @@ async def publish_manifest(
         berth_obj.contact = contact or berth_obj.contact
         store.upsert_berth(berth_obj)
 
-    int_errors = {int(k): v for k, v in (errors or {}).items()}
     manifest = Manifest(
         berth=berth, version=version, owner=owner,
         capabilities=capabilities or [], protocol=protocol,
@@ -897,9 +922,9 @@ async def send_message(
     if not recipients:
         return json.dumps({"error": "请提供收件人：to_agent 或 to_agents 至少一个有效 agent_id"}, ensure_ascii=False)
 
-    unregistered = [r for r in recipients if store.get_agent_token(r) is None]
-    if unregistered:
-        return json.dumps({"error": f"收件人未注册：{unregistered}"}, ensure_ascii=False)
+    recipient_errors = [e for r in recipients if (e := _check_recipient(store, r)) is not None]
+    if recipient_errors:
+        return json.dumps({"error": "；".join(recipient_errors)}, ensure_ascii=False)
 
     if reply_to:
         parent = store.get_message(reply_to)
@@ -1053,8 +1078,9 @@ async def admin_command(admin_token: str, to_agent: str, command: str, correlati
         return json.dumps({"error": err}, ensure_ascii=False)
 
     store = _get_store()
-    if store.get_agent_token(to_agent) is None:
-        return json.dumps({"error": f"agent_id={to_agent} 未注册"}, ensure_ascii=False)
+    recipient_err = _check_recipient(store, to_agent)
+    if recipient_err:
+        return json.dumps({"error": recipient_err}, ensure_ascii=False)
 
     msg = DirectMessage(
         from_agent="admin", to_agent=to_agent, message=command,
@@ -1228,13 +1254,29 @@ def admin_cleanup(
 async def notify(
     berth: str,
     event: str,
+    token: str,
     message: str = "",
     correlation_id: str = "",
-    actor: str = "system",
+    actor: str = "",
     severity: str = "normal",
 ) -> str:
-    """向 berth 的订阅者发送通知。"""
+    """向 berth 的订阅者发送通知。只有 berth 的 owner（用其 token 认证）可以广播——
+
+    否则任何人都能冒充任意 actor 向该 berth 的全部订阅者广播、拿着别人的名字发通知，
+    这跟 publish_manifest/subscribe 要求 token 认证是同一个道理。
+    actor 参数已废弃为兼容占位，实际广播身份以 token 认证到的 owner 为准。
+    """
     store = _get_store()
+
+    berth_obj = store.get_berth(berth)
+    if berth_obj is None:
+        return json.dumps({"error": f"berth={berth} 不存在"}, ensure_ascii=False)
+
+    auth_err = _check_auth(berth_obj.owner, token)
+    if auth_err:
+        _audit("auth.denied", actor or "unknown", f"berth:{berth}", {"reason": auth_err})
+        return json.dumps({"error": f"只有 berth={berth} 的 owner（{berth_obj.owner}）可以广播通知：{auth_err}"}, ensure_ascii=False)
+    real_actor = berth_obj.owner
 
     pri = NotifyPriority.NORMAL
     try:
@@ -1262,7 +1304,7 @@ async def notify(
             if ok:
                 pushed += 1
 
-    _audit("notify", actor, f"berth:{berth}", {
+    _audit("notify", real_actor, f"berth:{berth}", {
         "event": event, "recipients": matched, "severity": severity, "pushed": pushed,
     })
 
@@ -1460,7 +1502,9 @@ async def create_task(
 
     - title：一句话说清要什么（必填）
     - detail：补充说明/验收标准
-    - deadline：截止时间（ISO 格式如 2026-09-13T18:00 或 2026-09-13 18:00），空=不限时
+    - deadline：截止时间（ISO 格式如 2026-09-13T18:00 或 2026-09-13 18:00），按 UTC 解释
+      （不带时区信息的裸时间会被当成 UTC，不是本机时区——换算好了再填，否则超时判定会偏移）；
+      空=不限时
     - correlation_id：要与哪条消息线串起来（可选；任务自身的事件消息会以 task_id 串线）
     """
     store = _get_store()
@@ -1471,15 +1515,21 @@ async def create_task(
         return json.dumps({"error": auth_err}, ensure_ascii=False)
     if not title.strip():
         return json.dumps({"error": "title 必填：一句话说清要托付什么"}, ensure_ascii=False)
-    if store.get_agent_token(assignee) is None:
-        return json.dumps({"error": f"受托方 agent_id={assignee} 未注册"}, ensure_ascii=False)
+    assignee_err = _check_recipient(store, assignee)
+    if assignee_err:
+        return json.dumps({"error": f"受托方：{assignee_err}"}, ensure_ascii=False)
 
     deadline_iso = ""
     if deadline:
         try:
-            deadline_iso = datetime.fromisoformat(deadline.replace(" ", "T")).isoformat()
+            parsed = datetime.fromisoformat(deadline.replace(" ", "T"))
         except ValueError:
             return json.dumps({"error": "deadline 格式不对，要 ISO 格式如 2026-09-13T18:00"}, ensure_ascii=False)
+        # 裸时间（不带时区）统一按 UTC 解释，否则存进库里的字符串和 sweep_stale_tasks
+        # 拿 UTC now 做字符串比较时会产生时区偏移的误判（该超时的没超时，或反之）。
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        deadline_iso = parsed.isoformat()
 
     task = Task(creator=creator, assignee=assignee, title=title.strip(),
                 detail=detail, berth=berth, correlation_id=correlation_id,
@@ -1873,7 +1923,8 @@ def onboard_berth() -> str:
 
 请按以下步骤操作：
 
-1. 调用 harbor.register_agent(agent_id="你的团队名，如 auth-team") 获取 token（只显示一次，请保存）
+1. 调用 register_agent(agent_id="你的团队名，如 auth-team", display_name="显示名",
+   description="这个身份是干什么的") 获取 token（只显示一次，请立即保存到文件）
 2. 确定你的 Berth ID（如 auth, order, payment）
 3. 准备 Manifest 信息：
    - owner: 负责团队（必须等于第 1 步的 agent_id）
@@ -1882,16 +1933,18 @@ def onboard_berth() -> str:
    - base_url: 服务地址
    - auth: 认证方式
    - requirements: 调用要求
-   - errors: 错误码映射
+   - errors: 错误码映射（key 必须是数字错误码的字符串，如 "401"）
    - events: 可发布的事件
 
-4. 调用 harbor.publish_manifest 发布你的项目卡，带上第 1 步获取的 token
+4. 调用 publish_manifest 发布你的项目卡，带上第 1 步获取的 token
+
+注意：工具名不带 harbor. 前缀，直接调裸名字（如 register_agent、publish_manifest）。
 
 示例：
-  harbor.register_agent(agent_id="auth-team")
-  # -> 返回 token，请保存
+  register_agent(agent_id="auth-team", display_name="认证团队", description="负责登录认证与 token 签发")
+  # -> 返回 token，请立即保存
 
-  harbor.publish_manifest(
+  publish_manifest(
     berth="auth",
     version="1.0.0",
     owner="auth-team",

@@ -47,7 +47,7 @@ MCPHARBOR_TRANSPORT=streamable-http MCPHARBOR_ADMIN_TOKEN=<自己定的密钥> m
 | `harbor.search_agents` | 搜索参与者（Agent）名片——找"谁能干某件事"用这个（隐身/已吊销不出现在结果里） |
 | `harbor.subscribe` | 订阅 Berth 变更通知，需要 subscriber 对应的 token |
 | `harbor.open_session` | 不订阅任何 berth，只注册存活会话以接收私信推送 |
-| `harbor.notify` | 向 berth 全部订阅者广播通知 |
+| `harbor.notify` | 向 berth 全部订阅者广播通知，需要 berth owner 对应的 token（否则任何人都能冒充身份广播） |
 | `harbor.send_message` | 发送点对点私信，只有收发双方可见；支持 `to_agents` 多播、`reply_to` 引用串线程、`correlation_id` 话题串联 |
 | `harbor.get_messages` | 查询自己的私信（可按对话对象/未读过滤），需要自己的 token |
 | `harbor.get_conversations` | 对话列表：每个对象一条最新消息 + 未读数——消费者应关注最新消息，别翻平铺历史 |
@@ -153,7 +153,7 @@ async with Client("http://harbor-host:PORT/mcp", message_handler=Handler()) as c
 
 `harbor.notify` 和 `harbor.send_message` 是两条不同语义的通道，别搞混：
 
-- `harbor.notify(berth, event, ...)` 是**广播**——发给这个 berth 的所有订阅者，符合"契约变更了，关心这个 berth 的人都该知道"的场景。任何订阅了同一个 berth 的第三方都能看到。
+- `harbor.notify(berth, event, token, ...)` 是**广播**——发给这个 berth 的所有订阅者，符合"契约变更了，关心这个 berth 的人都该知道"的场景。任何订阅了同一个 berth 的第三方都能看到内容，但**只有 berth 的 owner 能发**（token 认证），第三方拿自己的合法 token 也广播不了别人的 berth。
 - `harbor.send_message(from_agent, to_agent, ...)` 是**点对点私信**——只有 `to_agent` 能收到推送、只有 `from_agent`/`to_agent` 双方能用各自的 token 通过 `harbor.get_messages` 查到。第三方即使订阅了同一个 berth，也完全看不到内容，`harbor.get_audit_log` 里也只会看到"谁给谁发了一条消息"这个元信息，看不到消息正文。
 
 ```python
