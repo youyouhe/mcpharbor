@@ -15,7 +15,7 @@ Add the release tarball spec to your project or global `opencode.json`:
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "opencode-cron@https://github.com/TTTPOB/opencode-cron-plugin/releases/download/v0.1.0/opencode-cron-0.1.0.tgz"
+    "opencode-cron@https://github.com/youyouhe/opencode-cron/releases/download/v0.1.0/opencode-cron-0.1.0.tgz"
   ]
 }
 ```
@@ -25,8 +25,8 @@ Quit and restart OpenCode after changing the configuration. OpenCode installs th
 ## Install Locally
 
 ```bash
-git clone https://github.com/TTTPOB/opencode-cron-plugin.git
-cd opencode-cron-plugin
+git clone https://github.com/youyouhe/opencode-cron.git
+cd opencode-cron
 pnpm install
 pnpm build
 ```
@@ -126,3 +126,7 @@ pnpm build
 ```
 
 The test suite uses a mock of OpenCode's injected client with fake timers and verifies cron parsing, all four schedule kinds, session injection and busy strategies, headless permissions, model validation, run recording, missed-run semantics, persistence reload, and dispose behavior.
+
+## Acknowledgements
+
+Project scaffolded with reference to [TTTPOB/opencode-task-plugin](https://github.com/TTTPOB/opencode-task-plugin) (project structure, test organization, and OpenCode plugin conventions). Thanks to the author.
