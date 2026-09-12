@@ -320,38 +320,6 @@ cp mcpharbor/agent-kit/plugins/cron-opencode.ts ~/.config/opencode/cron.ts
 # 效果：收件箱 count&gt;0 才注入会话；count=0 静默跳过本次</pre>
 </div>"""
 
-    # 来源：https://opencode.ai/docs/github/ （schedule 事件）
-    scheduled_card = """
-<div class="card connect" style="border-left-color:#8b5cf6;">
-  <h2>⏰ OpenCode 定时备选（未装插件时）</h2>
-  <p class="hint" style="margin:0 0 0.8rem;">OpenCode 本身没有内置 cron。<b>首选方案是上面的定时收信插件</b>；以下备选适合仓库在 GitHub 上、要做无人值守周期任务的场景：GitHub Actions 用 <code>schedule</code> 事件触发 <code>anomalyco/opencode/github</code> action（定时事件没有评论上下文，<code>prompt</code> 必填；要建分支/开 PR 需授予 <code>contents: write</code> 和 <code>pull-requests: write</code>）。自建部署也可以用系统 crontab + <code>opencode serve</code> 的 HTTP API（<code>POST /session/:id/message</code>）定时下发任务。</p>
-<pre class="codeblock"># .github/workflows/opencode-scheduled.yml
-name: Scheduled OpenCode Task
-on:
-  schedule:
-    - cron: "0 9 * * 1"   # 每周一 UTC 9 点
-jobs:
-  opencode:
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: write
-      pull-requests: write
-      issues: write
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - name: Run OpenCode
-        uses: anomalyco/opencode/github@latest
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        with:
-          model: anthropic/claude-sonnet-4-20250514
-          prompt: |
-            Review the codebase for any TODO comments and create a summary.
-            If you find issues worth addressing, open an issue to track them.</pre>
-</div>"""
 
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>MCP Harbor Admin</title>
@@ -411,8 +379,6 @@ code {{
 {tools_card}
 
 {cron_plugin_card}
-
-{scheduled_card}
 
 <div class="stats">
   <div class="stat"><b>{len(data['agents'])}</b><span>已注册参与者</span></div>

@@ -127,14 +127,8 @@ stdio 模式每 Agent 独立进程，推送不可达，必须走本门禁轮询�
 
 **第二步：注册身份/行为规范**同 Claude Code（把规范写进 `AGENTS.md`，OpenCode 读这个）。
 
-**第三步：定时收件**——首选上面的「⏰ 定时收信插件」（OpenCode 无内置 cron，装
-`cron-opencode.ts` 即得会话内定时 + Harbor 条件门）。备选两条路：
-
-1. GitHub Actions `schedule` 事件触发 `anomalyco/opencode/github` action，prompt 写
-   "检查 Harbor 收件箱并处理"（定时事件 prompt 必填）——适合仓库在 GitHub 上的无人值守
-   周期任务，详见 Harbor admin 面板「⏰ OpenCode 定时备选」卡片。
-2. 自建部署：系统 crontab + `opencode serve` 的 HTTP API（`POST /session/:id/message`）
-   定时下发"检查 Harbor 收件箱"；或直接复用 harbor_gate.sh + 无头 opencode 命令。
+**第三步：定时收件**——用上面的「⏰ 定时收信插件」（OpenCode 无内置 cron，装插件即得
+会话内定时 + Harbor 条件门），这是推荐的唯一方式。
 
 ### OMP（Oh My Pi）
 
