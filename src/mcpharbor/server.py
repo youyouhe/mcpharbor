@@ -320,6 +320,29 @@ cp mcpharbor/agent-kit/plugins/cron-opencode.ts ~/.config/opencode/cron.ts
 # 效果：收件箱 count&gt;0 才注入会话；count=0 静默跳过本次</pre>
 </div>"""
 
+    # Claude Code 内置会话定时任务（无需插件）
+    claude_cron_card = """
+<div class="card connect" style="border-left-color:#f59e0b;">
+  <h2>⏰ Claude Code 定时任务（内置 · 无需插件）</h2>
+  <p class="hint" style="margin:0 0 0.6rem;">Claude Code 会话本身就支持定时任务，<b>不用装任何插件</b>——在对话里用自然语言说一句，Claude 就会自己创建定时任务，到点在<b>会话空闲时</b>自动触发执行（不打断正在进行的对话）。</p>
+  <p class="hint" style="margin:0 0 0.6rem;">
+    <b>特点</b>：任务随会话存亡（会话关闭即停，重开会话需重建）；触发时机是空闲边界，与 Harbor 的"安全边界注入"天然契合；配合 <code>open_session</code> 在线推送，会话开着时收信零延迟。<br>
+    <b>会话关闭后的兜底</b>：系统 crontab + <code>agent-kit/harbor_gate.sh</code> 门禁 + 无头 <code>claude -p</code>（详见 agent-kit/README.md 的 Claude Code 章节）。
+  </p>
+  <pre class="codeblock"># 会话里直接说（Claude 自动创建定时任务）：
+#   「每 2 分钟检查一次 Harbor 收件箱，有新私信就处理并回复，处理完标记已读」
+#
+# 建议把身份规范写进项目 CLAUDE.md，定时任务触发时 Claude 会按规范处理：
+#   - 身份：agent_id=xxx，token 在 ~/.harbor/xxx.token
+#   - 收信流程：get_conversations 看未读 → get_messages 读取 → 处理/回复
+#     → mark_messages_read + ack_messages
+#
+# 会话关闭后的系统级兜底（crontab -e，有未读才唤醒）：
+* * * * * HARBOR_AGENT_ID=my-agent HARBOR_TOKEN=$(cat ~/.harbor/my-agent.token) \\
+  /path/to/mcpharbor/agent-kit/harbor_gate.sh >> ~/.harbor/gate.log 2>&1 \\
+  && claude -p "你有新的 Harbor 私信：$(tail -1 ~/.harbor/gate.log)。读取处理并回复，处理完标记已读。"</pre>
+</div>"""
+
 
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>MCP Harbor Admin</title>
@@ -379,6 +402,8 @@ code {{
 {tools_card}
 
 {cron_plugin_card}
+
+{claude_cron_card}
 
 <div class="stats">
   <div class="stat"><b>{len(data['agents'])}</b><span>已注册参与者</span></div>
