@@ -652,7 +652,10 @@ def register_agent(
         "agent_id": agent_id,
         "display_name": display_name,
         "token": token,
-        "message": "请保存此 token，之后不会再显示。调用写操作工具时需带上此 token。",
+        "message": ("⚠️ 请立即把 token 写入文件保存（如 ~/.harbor/token 或项目内的私密配置），"
+                    "不要只留在对话里——本次返回之后不会再显示，下次会话/新进程拿不到对话记忆。"
+                    "所有写操作都要带它。若彻底丢失：rotate_token 也需要旧 token，无法自助找回，"
+                    "只能请 admin purge 掉这个身份（连带清掉全部私信）后重新注册。"),
     }, ensure_ascii=False)
 
 
@@ -672,7 +675,7 @@ def rotate_token(agent_id: str, current_token: str) -> str:
         "status": "ok",
         "agent_id": agent_id,
         "token": new_token,
-        "message": "token 已更换，旧 token 已失效。",
+        "message": "token 已更换，旧 token 已失效。⚠️ 请立即把新 token 写入文件（如 ~/.harbor/token）覆盖旧值。",
     }, ensure_ascii=False)
 
 
