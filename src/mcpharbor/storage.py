@@ -7,10 +7,11 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .models import (
-    AgentToken, AuditEntry, Berth, BerthStatus, Contract, DirectMessage, Manifest,
-    Notification, NotifyPriority, Subscription,
+    AgentToken, AuditEntry, Berth, BerthStatus, Contract, ContractPin, DirectMessage,
+    Manifest, Notification, NotifyPriority, Subscription,
 )
 
 
@@ -108,9 +109,20 @@ class HarborStorage:
                 berth TEXT NOT NULL DEFAULT '',
                 message TEXT NOT NULL DEFAULT '',
                 correlation_id TEXT NOT NULL DEFAULT '',
+                reply_to TEXT NOT NULL DEFAULT '',
                 severity TEXT NOT NULL DEFAULT 'normal',
                 created_at TEXT NOT NULL,
                 read INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS contract_pins (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                berth TEXT NOT NULL,
+                version TEXT NOT NULL,
+                task_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                UNIQUE(agent_id, berth, task_id)
             );
 
             CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_agent);
@@ -133,13 +145,21 @@ class HarborStorage:
             CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
             CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
         """)
-        # 旧库迁移：agent_tokens 补齐身份档案列（display_name/description/contact）
+        # 旧库迁移：agent_tokens 补齐身份档案列（display_name/description/contact/capabilities/hidden）
         existing_cols = {r["name"] for r in conn.execute("PRAGMA table_info(agent_tokens)").fetchall()}
         for col in ("display_name", "description", "contact"):
             if col not in existing_cols:
                 conn.execute(f"ALTER TABLE agent_tokens ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
         if "last_seen" not in existing_cols:
             conn.execute("ALTER TABLE agent_tokens ADD COLUMN last_seen TEXT")
+        if "capabilities" not in existing_cols:
+            conn.execute("ALTER TABLE agent_tokens ADD COLUMN capabilities TEXT NOT NULL DEFAULT '[]'")
+        if "hidden" not in existing_cols:
+            conn.execute("ALTER TABLE agent_tokens ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+        # messages 补 reply_to（对旧消息引用链路向下兼容，旧行默认空串）
+        msg_cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "reply_to" not in msg_cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN reply_to TEXT NOT NULL DEFAULT ''")
         conn.commit()
 
     # ── Berth CRUD ──
@@ -426,6 +446,18 @@ class HarborStorage:
 
     # ── Agent Token ──
 
+    def _row_to_agent_token(self, row: sqlite3.Row) -> AgentToken:
+        return AgentToken(
+            agent_id=row["agent_id"], token_hash=row["token_hash"],
+            display_name=row["display_name"], description=row["description"],
+            contact=row["contact"],
+            capabilities=json.loads(row["capabilities"]) if "capabilities" in row.keys() else [],
+            hidden=bool(row["hidden"]) if "hidden" in row.keys() else False,
+            last_seen=datetime.fromisoformat(row["last_seen"]) if row["last_seen"] else None,
+            created_at=datetime.fromisoformat(row["created_at"]),
+            revoked=bool(row["revoked"]),
+        )
+
     def get_agent_token(self, agent_id: str) -> AgentToken | None:
         conn = self._get_conn()
         row = conn.execute(
@@ -433,26 +465,21 @@ class HarborStorage:
         ).fetchone()
         if not row:
             return None
-        return AgentToken(
-            agent_id=row["agent_id"], token_hash=row["token_hash"],
-            display_name=row["display_name"], description=row["description"],
-            contact=row["contact"],
-            last_seen=datetime.fromisoformat(row["last_seen"]) if row["last_seen"] else None,
-            created_at=datetime.fromisoformat(row["created_at"]),
-            revoked=bool(row["revoked"]),
-        )
+        return self._row_to_agent_token(row)
 
     def create_agent_token(
         self, agent_id: str, token_hash: str,
         display_name: str = "", description: str = "", contact: str = "",
+        capabilities: list[str] | None = None, hidden: bool = False,
     ) -> bool:
         """注册新 agent_id 的令牌（带身份档案）。若 agent_id 已存在则返回 False。"""
         conn = self._get_conn()
         try:
             conn.execute(
-                "INSERT INTO agent_tokens (agent_id, token_hash, display_name, description, contact, created_at, revoked)"
-                " VALUES (?, ?, ?, ?, ?, ?, 0)",
+                "INSERT INTO agent_tokens (agent_id, token_hash, display_name, description, contact, capabilities, hidden, created_at, revoked)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
                 (agent_id, token_hash, display_name, description, contact,
+                 json.dumps(capabilities or []), int(hidden),
                  datetime.now(timezone.utc).isoformat()),
             )
             conn.commit()
@@ -479,14 +506,19 @@ class HarborStorage:
         conn.commit()
         return cur.rowcount > 0
 
-    def purge_agent(self, agent_id: str) -> int:
-        """彻底删除 agent 的注册记录及其全部订阅，返回删除的订阅数。"""
+    def purge_agent(self, agent_id: str) -> tuple[int, int]:
+        """彻底删除 agent 的注册记录及其全部订阅、私信、契约钉，返回 (删除订阅数, 删除私信数)。"""
         conn = self._get_conn()
         subs = conn.execute("SELECT COUNT(*) AS n FROM subscriptions WHERE subscriber=?", (agent_id,)).fetchone()["n"]
+        msgs = conn.execute(
+            "SELECT COUNT(*) AS n FROM messages WHERE from_agent=? OR to_agent=?", (agent_id, agent_id)
+        ).fetchone()["n"]
         conn.execute("DELETE FROM subscriptions WHERE subscriber=?", (agent_id,))
+        conn.execute("DELETE FROM messages WHERE from_agent=? OR to_agent=?", (agent_id, agent_id))
+        conn.execute("DELETE FROM contract_pins WHERE agent_id=?", (agent_id,))
         conn.execute("DELETE FROM agent_tokens WHERE agent_id=?", (agent_id,))
         conn.commit()
-        return subs
+        return subs, msgs
 
     def rotate_agent_token(self, agent_id: str, new_token_hash: str) -> bool:
         """轮换已存在 agent_id 的令牌。若 agent_id 不存在则返回 False。"""
@@ -508,32 +540,60 @@ class HarborStorage:
         """管理视角：全部已注册的 agent（含 token_hash，调用方展示前应自行去掉）。"""
         conn = self._get_conn()
         rows = conn.execute("SELECT * FROM agent_tokens ORDER BY created_at ASC").fetchall()
-        return [
-            AgentToken(
-                agent_id=r["agent_id"], token_hash=r["token_hash"],
-                display_name=r["display_name"], description=r["description"],
-                contact=r["contact"],
-                last_seen=datetime.fromisoformat(r["last_seen"]) if r["last_seen"] else None,
-                created_at=datetime.fromisoformat(r["created_at"]),
-                revoked=bool(r["revoked"]),
-            )
-            for r in rows
-        ]
+        return [self._row_to_agent_token(r) for r in rows]
+
+    def search_agents(self, keyword: str = "", capability: str = "") -> list[AgentToken]:
+        """公开视角：搜索可见的 agent（排除已吊销和隐身注册的），不含 token_hash 也一样返回，
+        由调用方决定展示哪些字段。keyword 匹配 agent_id/显示名/描述/联系方式。"""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM agent_tokens WHERE revoked=0 AND hidden=0 ORDER BY created_at ASC"
+        ).fetchall()
+        agents = [self._row_to_agent_token(r) for r in rows]
+        if keyword:
+            kw = keyword.lower()
+            agents = [
+                a for a in agents
+                if kw in a.agent_id.lower()
+                or kw in a.display_name.lower()
+                or kw in a.description.lower()
+                or kw in a.contact.lower()
+                or any(kw in c.lower() for c in a.capabilities)
+            ]
+        if capability:
+            cap = capability.lower()
+            agents = [a for a in agents if any(cap == c.lower() for c in a.capabilities)]
+        return agents
 
     # ── Direct Message ──
+
+    def _row_to_message(self, r: sqlite3.Row) -> DirectMessage:
+        return DirectMessage(
+            id=r["id"], from_agent=r["from_agent"], to_agent=r["to_agent"],
+            berth=r["berth"], message=r["message"], correlation_id=r["correlation_id"],
+            reply_to=r["reply_to"] if "reply_to" in r.keys() else "",
+            severity=NotifyPriority(r["severity"]),
+            created_at=datetime.fromisoformat(r["created_at"]), read=bool(r["read"]),
+        )
 
     def add_message(self, msg: DirectMessage) -> DirectMessage:
         conn = self._get_conn()
         conn.execute("""
             INSERT INTO messages (id, from_agent, to_agent, berth, message,
-                correlation_id, severity, created_at, read)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                correlation_id, reply_to, severity, created_at, read)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             msg.id, msg.from_agent, msg.to_agent, msg.berth, msg.message,
-            msg.correlation_id, msg.severity.value, msg.created_at.isoformat(), int(msg.read),
+            msg.correlation_id, msg.reply_to, msg.severity.value,
+            msg.created_at.isoformat(), int(msg.read),
         ))
         conn.commit()
         return msg
+
+    def get_message(self, message_id: str) -> DirectMessage | None:
+        conn = self._get_conn()
+        row = conn.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
+        return self._row_to_message(row) if row else None
 
     def get_messages(
         self, agent_id: str, with_agent: str | None = None,
@@ -555,15 +615,48 @@ class HarborStorage:
             f"SELECT * FROM messages WHERE {where} ORDER BY created_at DESC LIMIT ?",
             params,
         ).fetchall()
-        return [
-            DirectMessage(
-                id=r["id"], from_agent=r["from_agent"], to_agent=r["to_agent"],
-                berth=r["berth"], message=r["message"], correlation_id=r["correlation_id"],
-                severity=NotifyPriority(r["severity"]),
-                created_at=datetime.fromisoformat(r["created_at"]), read=bool(r["read"]),
-            )
-            for r in rows
-        ]
+        return [self._row_to_message(r) for r in rows]
+
+    def get_conversations(self, agent_id: str) -> list[dict[str, Any]]:
+        """按对话对象聚合：每个对方一条最新消息 + 未读数。
+
+        消费者应关注最新消息——多轮往来后从这里一眼看清"谁发了什么、几条没读"，
+        再决定用 get_messages(with_agent=...) 展开哪段对话。
+        """
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE to_agent=? OR from_agent=? ORDER BY created_at DESC",
+            (agent_id, agent_id),
+        ).fetchall()
+        by_peer: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            msg = self._row_to_message(r)
+            peer = msg.from_agent if msg.to_agent == agent_id else msg.to_agent
+            entry = by_peer.get(peer)
+            if entry is None:
+                by_peer[peer] = {
+                    "peer": peer,
+                    "last_message": {
+                        "id": msg.id, "from_agent": msg.from_agent,
+                        "to_agent": msg.to_agent, "message": msg.message,
+                        "correlation_id": msg.correlation_id,
+                        "reply_to": msg.reply_to,
+                        "severity": msg.severity.value,
+                        "created_at": msg.created_at.isoformat(),
+                        "read": msg.read,
+                    },
+                    "unread": 0,
+                    "total": 0,
+                }
+                entry = by_peer[peer]
+            entry["total"] += 1
+            if msg.to_agent == agent_id and not msg.read:
+                entry["unread"] += 1
+        # 有未读的对话排最前（未读多者优先），其余按最新消息时间倒序
+        entries = sorted(by_peer.values(),
+                         key=lambda e: e["last_message"]["created_at"], reverse=True)
+        entries.sort(key=lambda e: e["unread"], reverse=True)
+        return entries
 
     def mark_messages_read(self, agent_id: str, message_ids: list[str]) -> int:
         """只能标记发给自己（to_agent=agent_id）的私信为已读。"""
@@ -640,6 +733,69 @@ class HarborStorage:
         cur = conn.execute("DELETE FROM notifications WHERE created_at<?", (cutoff,))
         conn.commit()
         return cur.rowcount
+
+    def cleanup_old_messages(self, days: int = 90) -> int:
+        """删除超过保留期的私信（已读未读一起删），返回删除条数。"""
+        conn = self._get_conn()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        cur = conn.execute("DELETE FROM messages WHERE created_at<?", (cutoff,))
+        conn.commit()
+        return cur.rowcount
+
+    # ── Contract Pin ──
+
+    def pin_contract(self, agent_id: str, berth: str, version: str, task_id: str = "") -> ContractPin:
+        """钉住某 berth 的某版本（同一 agent+berth+task_id 重复钉 = 更新版本）。"""
+        conn = self._get_conn()
+        conn.execute("""
+            INSERT INTO contract_pins (id, agent_id, berth, version, task_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(agent_id, berth, task_id) DO UPDATE SET
+                version=excluded.version, created_at=excluded.created_at
+        """, (
+            uuid4().hex[:12], agent_id, berth, version, task_id,
+            datetime.now(timezone.utc).isoformat(),
+        ))
+        conn.commit()
+        return ContractPin(agent_id=agent_id, berth=berth, version=version, task_id=task_id)
+
+    def unpin_contract(self, agent_id: str, berth: str, task_id: str = "") -> bool:
+        conn = self._get_conn()
+        cur = conn.execute(
+            "DELETE FROM contract_pins WHERE agent_id=? AND berth=? AND task_id=?",
+            (agent_id, berth, task_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+    def get_pins(self, agent_id: str) -> list[ContractPin]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM contract_pins WHERE agent_id=? ORDER BY created_at DESC",
+            (agent_id,),
+        ).fetchall()
+        return [
+            ContractPin(id=r["id"], agent_id=r["agent_id"], berth=r["berth"],
+                        version=r["version"], task_id=r["task_id"],
+                        created_at=datetime.fromisoformat(r["created_at"]))
+            for r in rows
+        ]
+
+    def get_pins_for_berth(self, berth: str, exclude_version: str = "") -> list[ContractPin]:
+        """某 berth 的全部钉子；exclude_version 非空时只返回钉在其它（旧）版本上的。"""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM contract_pins WHERE berth=?", (berth,)
+        ).fetchall()
+        pins = [
+            ContractPin(id=r["id"], agent_id=r["agent_id"], berth=r["berth"],
+                        version=r["version"], task_id=r["task_id"],
+                        created_at=datetime.fromisoformat(r["created_at"]))
+            for r in rows
+        ]
+        if exclude_version:
+            pins = [p for p in pins if p.version != exclude_version]
+        return pins
 
     # ── Check Updates ──
 

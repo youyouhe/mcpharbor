@@ -384,8 +384,8 @@ def test_direct_messages():
 
     # party-a 给 party-b 发私信
     resp = _send(from_agent="party-a", token=a_token, to_agent="party-b", message="秘密协议地址是 X")
-    assert resp["status"] == "ok"
-    msg_id = resp["message_id"]
+    assert resp["status"] == "ok" and resp["sent"] == 1
+    msg_id = resp["results"][0]["message_id"]
     print("✓ send_message: party-a -> party-b 发送成功")
 
     # party-b 能看到发给自己的私信

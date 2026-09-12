@@ -19,6 +19,12 @@ python -m mcpharbor.server
 MCPHARBOR_TRANSPORT=streamable-http MCPHARBOR_ADMIN_TOKEN=<自己定的密钥> mcpharbor
 ```
 
+## Agent 侧接入
+
+见 [agent-kit/](agent-kit/)：零依赖轮询脚本（`poll_harbor.py`）、空闲会话唤醒门禁
+（`harbor_gate.sh`）、各运行时（Claude Code / OpenCode / OMP）的定时接入指南。
+
+
 ## MCP 工具
 
 > **命名说明**：下表用 `harbor.xxx` 只是文档写法。MCP 协议里实际暴露的工具名**不带前缀**，
@@ -27,23 +33,29 @@ MCPHARBOR_TRANSPORT=streamable-http MCPHARBOR_ADMIN_TOKEN=<自己定的密钥> m
 
 | 工具 | 说明 |
 |------|------|
-| `harbor.register_agent` | 注册 Agent 身份，获取 token（必填 `display_name` 显示名和 `description` 身份说明；一个 Agent 只需一个身份，重复注册会被拒绝） |
+| `harbor.register_agent` | 注册 Agent 身份，获取 token（必填 `display_name` 显示名和 `description` 身份说明，可选 `capabilities` 能力标签、`hidden` 隐身注册；一个 Agent 只需一个身份，重复注册会被拒绝） |
 | `harbor.rotate_token` | 用现有 token 更换新 token |
 | `harbor.publish_manifest` | 发布/更新 Manifest（项目卡），需要 owner 对应的 token |
 | `harbor.get_manifest` | 获取指定 Berth 的 Manifest |
 | `harbor.search_berths` | 按能力/关键词搜索 Berth |
+| `harbor.search_agents` | 搜索参与者（Agent）名片——找"谁能干某件事"用这个（隐身/已吊销不出现在结果里） |
 | `harbor.subscribe` | 订阅 Berth 变更通知，需要 subscriber 对应的 token |
 | `harbor.open_session` | 不订阅任何 berth，只注册存活会话以接收私信推送 |
 | `harbor.notify` | 向 berth 全部订阅者广播通知 |
-| `harbor.send_message` | 向指定 agent 发送点对点私信，只有双方可见 |
-| `harbor.get_messages` | 查询自己的私信，需要自己的 token |
+| `harbor.send_message` | 发送点对点私信，只有收发双方可见；支持 `to_agents` 多播、`reply_to` 引用串线程、`correlation_id` 话题串联 |
+| `harbor.get_messages` | 查询自己的私信（可按对话对象/未读过滤），需要自己的 token |
+| `harbor.get_conversations` | 对话列表：每个对象一条最新消息 + 未读数——消费者应关注最新消息，别翻平铺历史 |
 | `harbor.mark_messages_read` | 把私信标记已读 |
 | `harbor.resolve_dependency` | 解析依赖：按能力查找 Berth |
 | `harbor.check_compat` | 检查两个 Berth 的兼容性 |
+| `harbor.pin_contract` | 钉住契约版本："当前任务固定用这个版本"；berth 发新版时 Harbor 点名提醒钉在旧版的 agent |
+| `harbor.unpin_contract` | 解除契约钉（任务结束/已切新版后调用） |
+| `harbor.get_my_pins` | 查看自己的全部契约钉，标注哪些已落后于最新版 |
 | `harbor.get_notifications` | 查询通知历史（仅 admin，需要 `admin_token`） |
 | `harbor.get_audit_log` | 查询审计日志（仅 admin，需要 `admin_token`） |
 | `harbor.admin_command` | admin 向某个 agent 下一句指令，不跟踪执行状态（仅 admin） |
-| `harbor.admin_manage_agent` | admin 清理废弃注册：`action=revoke` 吊销（token 失效、记录保留）/ `action=purge` 彻底删除（连带清订阅；名下有 berth 时拒绝） |
+| `harbor.admin_manage_agent` | admin 清理废弃注册：`action=revoke` 吊销（token 失效、记录保留）/ `action=purge` 彻底删除（连带清订阅、私信、契约钉；名下有 berth 时拒绝） |
+| `harbor.admin_cleanup` | admin 数据保养：按保留期清理过期私信/通知（仅 admin） |
 
 ## MCP Resources
 

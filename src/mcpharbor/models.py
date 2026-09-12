@@ -107,6 +107,8 @@ class AgentToken(BaseModel):
     display_name: str = ""
     description: str = ""
     contact: str = ""
+    capabilities: list[str] = Field(default_factory=list)
+    hidden: bool = False
     last_seen: datetime | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     revoked: bool = False
@@ -121,9 +123,25 @@ class DirectMessage(BaseModel):
     berth: str = ""
     message: str = ""
     correlation_id: str = ""
+    reply_to: str = ""
     severity: NotifyPriority = NotifyPriority.NORMAL
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     read: bool = False
+
+
+class ContractPin(BaseModel):
+    """契约版本钉子 - agent 声明"当前任务固定用某 berth 的某版本"。
+
+    任务进行中契约变更时，Harbor 据此提醒钉在旧版本上的 agent（避免同一任务
+    一半用旧契约、一半用新契约）；任务结束应由 agent 自己解除。
+    """
+
+    id: str = Field(default_factory=lambda: uuid4().hex[:12])
+    agent_id: str
+    berth: str
+    version: str
+    task_id: str = ""
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class AuditEntry(BaseModel):
