@@ -83,7 +83,13 @@ status() {
     if is_running; then
         local pid
         pid=$(cat "$PID_FILE")
-        echo "运行中 (PID $pid, 端口 $PORT)"
+        # 进程在 ≠ 服务可用：再用 /health 真探一次（DB 挂/端口没绑会在这里暴露）
+        if command -v curl >/dev/null 2>&1 \
+           && curl -sf --max-time 3 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+            echo "运行中 (PID $pid, 端口 $PORT, /health OK)"
+        else
+            echo "进程在 (PID $pid, 端口 $PORT) 但 /health 不通——服务未就绪或异常"
+        fi
         ps -o etime=,cmd= -p "$pid"
     else
         echo "未运行"

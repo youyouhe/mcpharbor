@@ -26,6 +26,29 @@ MCPHARBOR_TRANSPORT=streamable-http MCPHARBOR_ADMIN_TOKEN=<自己定的密钥> m
 - admin token 从 `~/.harbor/admin.token` 读取（chmod 600），也可用环境变量 `MCPHARBOR_ADMIN_TOKEN` 覆盖；
   端口/地址可用 `FASTMCP_PORT` / `FASTMCP_HOST` 覆盖（默认 `8931` / `0.0.0.0`，fastmcp 默认 8000）。
 - 数据在 `harbor.db`（SQLite），重启不丢已注册的 agent / berth / 订阅。
+- `status` 不只看进程：会真调一次 `GET /health` 探活（进程在但 DB/端口异常会如实报出）。
+
+## 健康检查
+
+`GET /health`（streamable-http 模式下，无鉴权，deploy.yaml / 监控 / 负载均衡探活直接用）：
+
+```json
+{
+  "status": "ok",            // unhealthy 时整个响应是 503
+  "service": "mcpharbor",
+  "db": "ok",                // SQLite 连通性（SELECT 1 实测，失败带原因）
+  "uptime_seconds": 171.8,
+  "heartbeat": {             // 后台心跳循环的活性证据（和 admin 面板的 agent 心跳是两回事）
+    "interval_seconds": 30,
+    "last_tick": "2026-09-13T07:48:32+00:00"   // 距今应恒 < 30s；null = 刚启动还没跑完一轮
+  },
+  "tool_count": 36,          // 握手应暴露的工具数，客户端侧 sanity check 用
+  "server_time": "2026-09-13T07:48:54+00:00"   // UTC 锚点
+}
+```
+
+响应只有运行状态元数据，不含任何参与者数据（agent 名单/消息计数都不给）。
+`stdio` 传输下没有 HTTP 端口，自然没有这个端点。
 
 ## Agent 侧接入
 

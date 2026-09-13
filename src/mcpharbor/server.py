@@ -44,9 +44,15 @@ _session_health: dict[str, dict[str, Any]] = {}
 _HEARTBEAT_INTERVAL_SECONDS = 30
 _HEARTBEAT_TIMEOUT_SECONDS = 5
 
+# /health 用：服务启动时刻（lifespan 会再校准）+ 心跳循环最近一轮完成时间。
+# 后者哪怕一个在线会话都没有也会推进——它是"后台循环还活着"的证据。
+_SERVICE_STARTED_AT = datetime.now(timezone.utc)
+_last_heartbeat_tick: str = ""
+
 
 async def _heartbeat_loop() -> None:
     """定时对登记在册的活跃会话发 MCP ping，记录存活状态；顺带做任务超时扫尾。"""
+    global _last_heartbeat_tick
     while True:
         for agent_id, session in list(_live_sessions.items()):
             alive = True
@@ -67,12 +73,15 @@ async def _heartbeat_loop() -> None:
                 _audit("file.sweep", "system", "harbor", {"removed_files": removed})
         except Exception:
             pass  # 过期文件清理失败同理，下一轮再试
+        _last_heartbeat_tick = _utc_now().isoformat()
         await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
 
 
 @asynccontextmanager
 async def _harbor_lifespan(server):
     """服务启动时拉起心跳循环，关闭时停掉。"""
+    global _SERVICE_STARTED_AT
+    _SERVICE_STARTED_AT = _utc_now()  # 以 lifespan 实际启动为准（比 import 时刻更真实）
     task = asyncio.create_task(_heartbeat_loop())
     yield
     task.cancel()
@@ -2843,6 +2852,41 @@ def contract_resource(berth_id: str, version: str) -> str:
     if contract is None:
         return json.dumps({"error": f"berth={berth_id} v{version} 的 contract 未找到"}, ensure_ascii=False)
     return contract.model_dump_json(indent=2)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  健康检查（无鉴权、不暴露任何参与者信息；deploy.yaml / 监控 / 负载均衡探活用）
+# ═══════════════════════════════════════════════════════════════════
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request):
+    """服务级健康检查：HTTP 200 = 服务可用，503 = 不可用（当前只有 DB 探测失败一种）。
+
+    和 admin 面板里的「心跳」是两回事：心跳是 Harbor → agent 会话的活性探测，
+    这里是外部 → Harbor 服务自身的探活。响应只有运行状态元数据，没有任何参与者数据。
+    """
+    from starlette.responses import JSONResponse
+
+    db_status = "ok"
+    try:
+        _get_store()._get_conn().execute("SELECT 1").fetchone()
+    except Exception as exc:  # noqa: BLE001 —— 健康检查要把故障原因带出去
+        db_status = f"error: {exc}"
+
+    body = {
+        "status": "ok" if db_status == "ok" else "unhealthy",
+        "service": "mcpharbor",
+        "db": db_status,
+        "uptime_seconds": round((_utc_now() - _SERVICE_STARTED_AT).total_seconds(), 1),
+        # 心跳循环活性证据：正常应恒小于 interval；刚启动一轮没跑完时为 null
+        "heartbeat": {
+            "interval_seconds": _HEARTBEAT_INTERVAL_SECONDS,
+            "last_tick": _last_heartbeat_tick or None,
+        },
+        "tool_count": len(await mcp.get_tools()),
+        "server_time": _utc_now().isoformat(),
+    }
+    return JSONResponse(body, status_code=200 if db_status == "ok" else 503)
 
 
 # ═══════════════════════════════════════════════════════════════════
