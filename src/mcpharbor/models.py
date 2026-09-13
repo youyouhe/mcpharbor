@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 from uuid import uuid4
@@ -107,6 +107,7 @@ class AgentToken(BaseModel):
     display_name: str = ""
     description: str = ""
     contact: str = ""
+    timezone: str = ""  # IANA 时区名（如 Asia/Shanghai）；Harbor 时间戳一律 UTC，这里声明本地时区供换算
     capabilities: list[str] = Field(default_factory=list)
     hidden: bool = False
     last_seen: datetime | None = None
@@ -137,6 +138,30 @@ class DirectMessage(BaseModel):
     # ack = 收件方明确确认"收到并认领"（比已读更强：已读只代表看到，ack 代表对这个消息负责）
     acked: bool = False
     acked_at: datetime | None = None
+
+
+class HarborFile(BaseModel):
+    """寄存文件 - 内容落盘（harbor_files/<file_id>），库里只存元数据。
+
+    为什么不走私信正文：脚本/配置这类文件全文塞进 message，多播 N 人就存 N 份、
+    推送 summary 还会再带一遍，收发双方的 LLM 上下文一起被刷爆。寄存后私信正文
+    只有一条带 file_id 的短通知，收件方用 harbor.get_file 按权限拉取。
+    磁盘文件名就是 file_id（uuid），原始 filename 只作展示——路径穿越天然免疫。
+    """
+
+    id: str = Field(default_factory=lambda: uuid4().hex[:16])
+    filename: str
+    size: int = 0  # UTF-8 字节数
+    sha256: str = ""
+    sender: str
+    recipients: list[str] = Field(default_factory=list)  # 多播共享同一份内容
+    note: str = ""
+    correlation_id: str = ""
+    severity: NotifyPriority = NotifyPriority.NORMAL
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    expires_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc) + timedelta(days=7))
+    fetched: list[dict[str, Any]] = Field(default_factory=list)  # [{"agent_id":…, "at": iso}]
 
 
 class TaskStatus(str, Enum):

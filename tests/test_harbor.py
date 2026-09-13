@@ -290,13 +290,13 @@ def test_auth():
         return json.loads(asyncio.run(server.publish_manifest.fn(**kwargs)))
 
     # register_agent
-    resp = json.loads(server.register_agent.fn("auth-team", display_name="认证团队", description="负责认证与签发契约的团队"))
+    resp = json.loads(server.register_agent.fn("auth-team", timezone="Asia/Shanghai", display_name="认证团队", description="负责认证与签发契约的团队"))
     assert resp["status"] == "ok" and resp["token"]
     auth_token = resp["token"]
     print("✓ register_agent: auth-team 注册成功")
 
     # 重复注册应失败
-    dup = json.loads(server.register_agent.fn("auth-team", display_name="认证团队", description="负责认证与签发契约的团队"))
+    dup = json.loads(server.register_agent.fn("auth-team", timezone="Asia/Shanghai", display_name="认证团队", description="负责认证与签发契约的团队"))
     assert "error" in dup and "重复注册" in dup["error"]
     print("✓ register_agent: 重复注册被拒绝")
 
@@ -307,13 +307,13 @@ def test_auth():
         {"agent_id": "no-profile", "display_name": "  ", "description": "  有空格的说明文字  "},
         {"agent_id": "no-profile", "display_name": "无名氏", "description": "短"},
     ):
-        resp = json.loads(server.register_agent.fn(**kwargs))
+        resp = json.loads(server.register_agent.fn(**kwargs, timezone="Asia/Shanghai"))
         assert "error" in resp, kwargs
     print("✓ register_agent: 缺 display_name/description 被拒绝")
 
     # 非法 agent_id 格式应被拒绝
     for bad in ("WangXiaoya", "wang xiaoya", "-wang", "王小丫"):
-        resp = json.loads(server.register_agent.fn(bad, display_name="x", description="格式测试的身份说明"))
+        resp = json.loads(server.register_agent.fn(bad, timezone="Asia/Shanghai", display_name="x", description="格式测试的身份说明"))
         assert "error" in resp, bad
     print("✓ register_agent: 非法 agent_id 格式被拒绝")
 
@@ -323,7 +323,7 @@ def test_auth():
     print("✓ publish_manifest: 未注册身份被拒绝")
 
     # 注册 mallory，尝试用 mallory 的 token 冒充 auth-team 发布
-    mallory_resp = json.loads(server.register_agent.fn("mallory", display_name="攻击者", description="模拟冒充者的测试身份"))
+    mallory_resp = json.loads(server.register_agent.fn("mallory", timezone="Asia/Shanghai", display_name="攻击者", description="模拟冒充者的测试身份"))
     mallory_token = mallory_resp["token"]
     resp = _publish(berth="auth", version="1.0.0", owner="auth-team", token=mallory_token)
     assert "error" in resp and "无效" in resp["error"]
@@ -372,9 +372,9 @@ def test_direct_messages():
     def _send(**kwargs):
         return json.loads(asyncio.run(server.send_message.fn(**kwargs)))
 
-    a_token = json.loads(server.register_agent.fn("party-a", display_name="甲方", description="点对点私信测试身份A"))["token"]
-    b_token = json.loads(server.register_agent.fn("party-b", display_name="乙方", description="点对点私信测试身份B"))["token"]
-    c_token = json.loads(server.register_agent.fn("party-c", display_name="丙方", description="点对点私信测试身份C"))["token"]
+    a_token = json.loads(server.register_agent.fn("party-a", timezone="Asia/Shanghai", display_name="甲方", description="点对点私信测试身份A"))["token"]
+    b_token = json.loads(server.register_agent.fn("party-b", timezone="Asia/Shanghai", display_name="乙方", description="点对点私信测试身份B"))["token"]
+    c_token = json.loads(server.register_agent.fn("party-c", timezone="Asia/Shanghai", display_name="丙方", description="点对点私信测试身份C"))["token"]
     print("✓ 注册 party-a / party-b / party-c")
 
     # 收件人未注册应报错
@@ -460,7 +460,7 @@ def test_admin_panel():
             display_name="<b>evil</b>", description="恶意注册者测试身份",
         )
         assert inserted
-        a_token = json.loads(server.register_agent.fn("admin-test-agent", display_name="worker", description="admin指令测试身份"))["token"]
+        a_token = json.loads(server.register_agent.fn("admin-test-agent", timezone="Asia/Shanghai", display_name="worker", description="admin指令测试身份"))["token"]
         asyncio.run(server.publish_manifest.fn(
             berth="auth", version="1.0.0", owner="admin-test-agent", token=a_token,
         ))
@@ -520,11 +520,11 @@ def test_admin_command():
             return json.loads(asyncio.run(server.admin_command.fn(**kwargs)))
 
         # "admin" 是保留身份，普通 agent 不能抢注
-        resp = json.loads(server.register_agent.fn("admin", display_name="管理员", description="保留身份测试"))
+        resp = json.loads(server.register_agent.fn("admin", timezone="Asia/Shanghai", display_name="管理员", description="保留身份测试"))
         assert "error" in resp and "保留" in resp["error"]
         print("✓ register_agent: agent_id=admin 被拒绝注册")
 
-        worker_token = json.loads(server.register_agent.fn("worker-agent", display_name="worker", description="admin指令测试身份"))["token"]
+        worker_token = json.loads(server.register_agent.fn("worker-agent", timezone="Asia/Shanghai", display_name="worker", description="admin指令测试身份"))["token"]
 
         # 没配置 MCPHARBOR_ADMIN_TOKEN 时整体不可用
         resp = _cmd(admin_token="anything", to_agent="worker-agent", command="停止当前任务")
@@ -585,7 +585,7 @@ def test_admin_command():
         print("✓ admin_manage_agent: revoke 后 token 立即失效、记录保留")
 
         # purge：有 berth 的 agent 不能直接删
-        b_token = json.loads(server.register_agent.fn("purge-owner", display_name="泊主", description="purge流程测试身份"))["token"]
+        b_token = json.loads(server.register_agent.fn("purge-owner", timezone="Asia/Shanghai", display_name="泊主", description="purge流程测试身份"))["token"]
         asyncio.run(server.publish_manifest.fn(berth="purge-test", version="0.1.0", owner="purge-owner", token=b_token))
         resp = _mg(admin_token="s3cr3t", agent_id="purge-owner", action="purge")
         assert "error" in resp and "berth" in resp["error"]
@@ -598,7 +598,7 @@ def test_admin_command():
         print("✓ admin_manage_agent: purge 彻底删除注册记录")
 
         # last_seen：成功认证后刷新
-        seen = json.loads(server.register_agent.fn("seen-agent", display_name="活跃", description="last_seen 追踪测试身份"))
+        seen = json.loads(server.register_agent.fn("seen-agent", timezone="Asia/Shanghai", display_name="活跃", description="last_seen 追踪测试身份"))
         assert server._get_store().get_agent_token("seen-agent").last_seen is None
         server.get_messages.fn(agent_id="seen-agent", token=seen["token"])
         assert server._get_store().get_agent_token("seen-agent").last_seen is not None
@@ -629,7 +629,7 @@ async def _native_push_scenario():
     sub_client = Client(server.mcp, message_handler=Handler())
 
     async with pub_client:
-        r = await pub_client.call_tool("register_agent", {"agent_id": "auth-team", "display_name": "认证团队", "description": "负责认证与签发契约的团队"})
+        r = await pub_client.call_tool("register_agent", {"agent_id": "auth-team", "display_name": "认证团队", "description": "负责认证与签发契约的团队", "timezone": "Asia/Shanghai"})
         token = json.loads(r.data)["token"]
 
         r = await pub_client.call_tool("publish_manifest", {
@@ -639,7 +639,7 @@ async def _native_push_scenario():
         print("✓ 首次发布：还没有订阅者，pushed=0")
 
         async with sub_client:
-            r = await sub_client.call_tool("register_agent", {"agent_id": "order-agent", "display_name": "订单代理", "description": "订阅订单契约变更的代理"})
+            r = await sub_client.call_tool("register_agent", {"agent_id": "order-agent", "display_name": "订单代理", "description": "订阅订单契约变更的代理", "timezone": "Asia/Shanghai"})
             order_token = json.loads(r.data)["token"]
 
             r = await sub_client.call_tool("subscribe", {

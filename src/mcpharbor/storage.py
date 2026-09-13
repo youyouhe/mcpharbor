@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -11,13 +13,24 @@ from uuid import uuid4
 
 from .models import (
     AgentToken, AuditEntry, Berth, BerthStatus, Contract, ContractPin, DirectMessage,
-    Manifest, Notification, NotifyPriority, Subscription, Task, TaskStatus,
+    HarborFile, Manifest, Notification, NotifyPriority, Subscription, Task, TaskStatus,
 )
+
+
+def _resolve_files_dir(db_path: str | Path) -> Path:
+    """寄存文件的落盘目录：跟随 harbor.db 所在目录（harbor.db 同级的 harbor_files/）。
+
+    :memory:（tests）没有真路径，兜底到临时目录——目录在 save_file 时才真正创建。
+    """
+    if str(db_path) == ":memory:":
+        return Path(tempfile.mkdtemp(prefix="harbor_files_"))
+    return Path(db_path).expanduser().resolve().parent / "harbor_files"
 
 
 class HarborStorage:
     def __init__(self, db_path: str | Path = "harbor.db"):
         self.db_path = str(db_path)
+        self.files_dir = _resolve_files_dir(self.db_path)
         self._conn: sqlite3.Connection | None = None
         self._init_db()
 
@@ -158,6 +171,23 @@ class HarborStorage:
                 detail TEXT NOT NULL DEFAULT '{}'
             );
 
+            CREATE TABLE IF NOT EXISTS files (
+                id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                size INTEGER NOT NULL DEFAULT 0,
+                sha256 TEXT NOT NULL DEFAULT '',
+                sender TEXT NOT NULL,
+                recipients TEXT NOT NULL DEFAULT '[]',
+                note TEXT NOT NULL DEFAULT '',
+                correlation_id TEXT NOT NULL DEFAULT '',
+                severity TEXT NOT NULL DEFAULT 'normal',
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                fetched TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE INDEX IF NOT EXISTS idx_files_sender ON files(sender);
+            CREATE INDEX IF NOT EXISTS idx_files_expires ON files(expires_at);
+
             CREATE INDEX IF NOT EXISTS idx_manifests_berth ON manifests(berth);
             CREATE INDEX IF NOT EXISTS idx_contracts_berth ON contracts(berth);
             CREATE INDEX IF NOT EXISTS idx_subscriptions_berth ON subscriptions(berth);
@@ -177,6 +207,8 @@ class HarborStorage:
             conn.execute("ALTER TABLE agent_tokens ADD COLUMN capabilities TEXT NOT NULL DEFAULT '[]'")
         if "hidden" not in existing_cols:
             conn.execute("ALTER TABLE agent_tokens ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+        if "timezone" not in existing_cols:
+            conn.execute("ALTER TABLE agent_tokens ADD COLUMN timezone TEXT NOT NULL DEFAULT ''")
         # messages 补 reply_to / ack（对旧消息向下兼容，旧行默认未 ack）
         msg_cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
         if "reply_to" not in msg_cols:
@@ -511,6 +543,7 @@ class HarborStorage:
             agent_id=row["agent_id"], token_hash=row["token_hash"],
             display_name=row["display_name"], description=row["description"],
             contact=row["contact"],
+            timezone=row["timezone"] if "timezone" in row.keys() else "",
             capabilities=json.loads(row["capabilities"]) if "capabilities" in row.keys() else [],
             hidden=bool(row["hidden"]) if "hidden" in row.keys() else False,
             last_seen=datetime.fromisoformat(row["last_seen"]) if row["last_seen"] else None,
@@ -531,21 +564,31 @@ class HarborStorage:
         self, agent_id: str, token_hash: str,
         display_name: str = "", description: str = "", contact: str = "",
         capabilities: list[str] | None = None, hidden: bool = False,
+        timezone_name: str = "",
     ) -> bool:
-        """注册新 agent_id 的令牌（带身份档案）。若 agent_id 已存在则返回 False。"""
+        """注册新 agent_id 的令牌（带身份档案）。若 agent_id 已存在则返回 False。
+
+        参数名用 timezone_name 而不是 timezone——后者会遮住 datetime.timezone。
+        """
         conn = self._get_conn()
         try:
             conn.execute(
-                "INSERT INTO agent_tokens (agent_id, token_hash, display_name, description, contact, capabilities, hidden, created_at, revoked)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                "INSERT INTO agent_tokens (agent_id, token_hash, display_name, description, contact, capabilities, hidden, timezone, created_at, revoked)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
                 (agent_id, token_hash, display_name, description, contact,
-                 json.dumps(capabilities or []), int(hidden),
+                 json.dumps(capabilities or []), int(hidden), timezone_name,
                  datetime.now(timezone.utc).isoformat()),
             )
             conn.commit()
             return True
         except sqlite3.IntegrityError:
             return False
+
+    def update_agent_timezone(self, agent_id: str, tz: str) -> None:
+        """更新 agent 声明的时区（老注册补声明走 open_session，不必重新注册）。"""
+        conn = self._get_conn()
+        conn.execute("UPDATE agent_tokens SET timezone=? WHERE agent_id=?", (tz, agent_id))
+        conn.commit()
 
     def touch_agent_last_seen(self, agent_id: str) -> None:
         """记录 agent 最后一次成功通过认证的时间，用于识别僵尸注册。"""
@@ -839,6 +882,99 @@ class HarborStorage:
     def count_messages(self) -> int:
         conn = self._get_conn()
         return conn.execute("SELECT COUNT(*) AS n FROM messages").fetchone()["n"]
+
+    # ── File（寄存文件：内容落盘 harbor_files/，库里只存元数据）──
+
+    def _row_to_file(self, r: sqlite3.Row) -> HarborFile:
+        return HarborFile(
+            id=r["id"], filename=r["filename"], size=r["size"], sha256=r["sha256"],
+            sender=r["sender"], recipients=json.loads(r["recipients"]),
+            note=r["note"], correlation_id=r["correlation_id"],
+            severity=NotifyPriority(r["severity"]),
+            created_at=datetime.fromisoformat(r["created_at"]),
+            expires_at=datetime.fromisoformat(r["expires_at"]),
+            fetched=json.loads(r["fetched"]),
+        )
+
+    def save_file(self, f: HarborFile, content: str) -> HarborFile:
+        """内容原子落盘（先盘后库：写盘失败抛 OSError，不落库不发通知）+ 插元数据行。"""
+        self.files_dir.mkdir(parents=True, exist_ok=True)
+        while (path := self.files_dir / f.id).exists():
+            f.id = uuid4().hex[:16]  # file_id 即磁盘名，冲突重生成
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, path)
+        conn = self._get_conn()
+        conn.execute("""
+            INSERT INTO files (id, filename, size, sha256, sender, recipients,
+                note, correlation_id, severity, created_at, expires_at, fetched)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            f.id, f.filename, f.size, f.sha256, f.sender,
+            json.dumps(f.recipients), f.note, f.correlation_id, f.severity.value,
+            f.created_at.isoformat(), f.expires_at.isoformat(), json.dumps(f.fetched),
+        ))
+        conn.commit()
+        return f
+
+    def get_file_meta(self, file_id: str) -> HarborFile | None:
+        conn = self._get_conn()
+        row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+        return self._row_to_file(row) if row else None
+
+    def read_file_content(self, file_id: str) -> str | None:
+        """读内容；文件已丢失（被手工删/清理残留）返回 None。"""
+        try:
+            return (self.files_dir / file_id).read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            return None
+
+    def touch_file_fetch(self, file_id: str, agent_id: str) -> None:
+        """记录谁在什么时候取过（fetched JSON 追加写回；行不存在则忽略）。"""
+        conn = self._get_conn()
+        row = conn.execute("SELECT fetched FROM files WHERE id=?", (file_id,)).fetchone()
+        if not row:
+            return
+        fetched = json.loads(row["fetched"])
+        fetched.append({"agent_id": agent_id, "at": datetime.now(timezone.utc).isoformat()})
+        conn.execute("UPDATE files SET fetched=? WHERE id=?", (json.dumps(fetched), file_id))
+        conn.commit()
+
+    def list_files_for(self, agent_id: str) -> list[HarborFile]:
+        """我发送或我接收的未过期文件，按创建时间倒序。
+
+        recipients LIKE 只做粗筛（索引覆盖不了 recipients 的 JSON 包含查询），
+        命中后必须 json.loads 精确复核——否则 sender='bot' 会 LIKE 匹配到 '"robot"'。
+        """
+        conn = self._get_conn()
+        now = datetime.now(timezone.utc).isoformat()
+        rows = conn.execute(
+            "SELECT * FROM files WHERE (sender=? OR recipients LIKE ?) AND expires_at>? "
+            "ORDER BY created_at DESC",
+            (agent_id, f'%"{agent_id}"%', now),
+        ).fetchall()
+        out = []
+        for r in rows:
+            if agent_id == r["sender"] or agent_id in json.loads(r["recipients"]):
+                out.append(self._row_to_file(r))
+        return out
+
+    def cleanup_expired_files(self) -> int:
+        """删过期文件的元数据行 + 磁盘内容。磁盘 unlink 失败只吞（行照删，不阻塞清理）。"""
+        conn = self._get_conn()
+        now = datetime.now(timezone.utc).isoformat()
+        rows = conn.execute("SELECT id FROM files WHERE expires_at<=?", (now,)).fetchall()
+        removed = 0
+        for r in rows:
+            try:
+                (self.files_dir / r["id"]).unlink(missing_ok=True)
+            except OSError:
+                pass  # 孤儿文件不阻塞清理，本期不回收
+            conn.execute("DELETE FROM files WHERE id=?", (r["id"],))
+            removed += 1
+        if removed:
+            conn.commit()
+        return removed
 
     # ── Audit ──
 

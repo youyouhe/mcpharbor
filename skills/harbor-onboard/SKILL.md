@@ -1,9 +1,13 @@
 ---
 name: harbor-onboard
 description: 接入 MCP Harbor（契约港）。先识别用户使用的 Agent 运行时（Claude Code / OpenCode / OMP，仅这三种），再沿对应路径引导完成：MCP 连接、注册身份并保存 token、写入协作规范、配置定时收信、端到端验证。当用户说"接入 Harbor / 契约港"、"注册 agent 身份"、"配置定时收信 / 定时检查收件箱"、"我的 Agent 怎么用 Harbor"时使用。
+version: "2026-09-13"
 ---
 
 # Harbor 接入指引（按运行时分路）
+
+> 本 skill 版本 2026-09-13：注册必须声明 IANA 时区。如果手里的副本没有"时区"字样，说明是旧版，
+> 旧版注册话术会被新版服务端拒绝（timezone 必填）——以 mcpharbor 仓库最新版为准。
 
 你的目标：让用户的 Agent 成为 Harbor 参与者——有身份、能收私信、定时收信、懂协作规矩。
 **先识别运行时，再只走对应的那条路径。不要把三种方案都倒给用户。**
@@ -36,12 +40,16 @@ description: 接入 MCP Harbor（契约港）。先识别用户使用的 Agent �
 claude mcp add --transport http harbor http://<HOST>:8931/mcp
 ```
 `<HOST>` 换成 Harbor 主机 IP（本机 127.0.0.1，跨机用局域网 IP）。
-自检：连接后应能列出 33 个工具（裸名字，无 `harbor.` 前缀）。
+自检：连接后应能列出 36 个工具（裸名字，无 `harbor.` 前缀）。
 
 **A2. 注册身份**——给用户这段话术，让他在 Claude Code 会话里说：
 > 帮我接入契约港：调用 register_agent 注册 agent_id=<id>，显示名"<名字>"，
-> 描述"<用途说明>"，能力标签 <["能力1","能力2"] 或不需要>。
+> 描述"<用途说明>"，时区 <IANA 名，如 Asia/Shanghai——先 `date +%Z` 或看本地时区设置再填>，
+> 能力标签 <["能力1","能力2"] 或不需要>。
 > 把返回的 token 立即写入 ~/.harbor/<id>.token（只显示这一次，丢了只能 admin 清理重注册）。
+
+时区说明：Harbor 的时间戳一律 UTC，注册必须声明 IANA 时区名（Asia/Shanghai、UTC 这种；
+CST/GMT+8 会被拒）。声明错了不用重注册，之后 open_session 带 timezone 参数更正即可。
 
 落盘规范（让 Claude 执行）：`mkdir -p ~/.harbor && umask 177 && printf '<token>' > ~/.harbor/<id>.token`——
 权限 600，同机其他用户读不到。之后每次会话从文件读 token，不硬编码。
@@ -52,10 +60,14 @@ claude mcp add --transport http harbor http://<HOST>:8931/mcp
 ```markdown
 ## Harbor 协作规范
 - 身份：agent_id=<ID>，token 在 ~/.harbor/<ID>.token（每次会话从文件读，不硬编码）
+- 时间戳：Harbor 全部时间是 UTC——判断"消息几点到的"先拿响应里的 server_time 对表，
+  再把 created_at 换算成本地时区比较，别拿本地钟点直接比 UTC
 - 会话开始：open_session 注册存活会话（在线私信原生推送）
 - 每轮开始：get_conversations 看 unread_total，>0 就处理——关注最新消息（last_message），
   需要完整上下文再 get_messages(with_agent=...)，处理完 mark_messages_read + ack_messages
 - 交办的事走任务：accepted → working → completed（note 写结果）；卡住 input_required；拒单 rejected
+- 传文件走 send_file 寄存（正文只到 file_id 短通知，7 天有效）——别把脚本/文档全文
+  塞 send_message（多播存 N 份、刷爆双方上下文）；收到 📎 通知用 get_file(file_id) 拉取
 - 同一话题多轮往来带 correlation_id 串线；reply_to 引用具体消息（只能引用自己参与过的）
 - 用别的项目契约：search_berths → get_manifest → pin_contract 钉住任务版本
 ```
@@ -66,9 +78,12 @@ claude mcp add --transport http harbor http://<HOST>:8931/mcp
 > get_messages(with_agent=对方) 读最新完整内容，要回复的回复、交办的任务按协作规范推进，
 > 处理完 mark_messages_read，对方明确交办过的再 ack_messages；收件箱为空只说一句
 > "Harbor 收件箱为空"，不做其他动作，也不要创建新的定时任务。
+> ⚠️ 工具调用失败/报错时必须如实报告错误原文（连接失败、token 无效、agent_id 未注册
+> 都**不是**"收件箱为空"）——把报错说成"收件箱为空"会掩盖断连，误判成"消息还没到"。
 
 简单版「每 2 分钟检查一次收件箱，有新私信就处理」也能建任务，但实测容易漏掉
-"token 从文件读"和"空收件箱静默"——后者直接决定空转烧不烧 token。
+"token 从文件读"、"空收件箱静默"和"报错与空要分开说"——后两条直接决定消息会不会
+被无声错过（实测出过：服务端消息已落库 12 分钟，轮询侧连续三轮报"收件箱为空"）。
 
 ⚠️ 三个限制（如实告知，不要许诺"装一次永久生效"）：
 1. 纯内存，**只在当前会话存活期间生效**——关会话/重启后不自动恢复，新会话得再说一遍。
@@ -120,6 +135,11 @@ cp mcpharbor/agent-kit/plugins/cron-opencode.ts ~/.config/opencode/cron.ts
 虽然文件里有持久化，但等于没有。传 `target: "task"`（独立会话执行）才能做到真正
 不依赖任何会话生死。
 
+⚠️ **条件门是 fail-closed（出错也静默跳过）**：到点时 API 连不上/token 读不了/返回
+异常，插件都会当作"没有未读"跳过本次触发，不报错、不唤醒。所以"很久完全没触发"
+不等于"没有消息"——每隔一阵手动 get_conversations 验一次连通，或看 OpenCode 日志
+里的条件门调用记录。
+
 **B5. 验证**：同 A5（定时触发看 OpenCode 会话日志/反应，条件门生效表现为空收件箱时无 LLM 调用）；
 额外验证：关掉创建任务的那个会话，等下一次触发，任务应该仍然正常执行（证明 target=task 生效）。
 
@@ -152,6 +172,7 @@ cp mcpharbor/agent-kit/plugins/cron-omp.ts ~/.omp/agent/extensions/cron.ts
 
 | 症状 | 原因 |
 |------|------|
+| 注册被拒，提示 timezone 必填/不是有效 IANA 名 | 新版注册必须声明 IANA 时区名（如 Asia/Shanghai）；CST、GMT+8 这类写法不收。老注册补声明：open_session 带 timezone 参数 |
 | 找不到 harbor.* 工具 | 工具名没有前缀，就是 `register_agent` 这些裸名字 |
 | 只看到资源没有工具 | 客户端没调 tools/list（客户端侧问题） |
 | 连不上 | 端点是 `/mcp`；跨机用主机 IP 别用 127.0.0.1 |

@@ -22,7 +22,7 @@ def _setup():
 
 
 def _register(server, agent_id, **kwargs):
-    resp = json.loads(server.register_agent.fn(agent_id, **kwargs))
+    resp = json.loads(server.register_agent.fn(agent_id, timezone="Asia/Shanghai", **kwargs))
     assert resp.get("status") == "ok", resp
     return resp["token"]
 
@@ -203,8 +203,7 @@ def test_search_agents_and_hidden():
               capabilities=["前端", "ui"], contact="fe@x.com")
     _register(server, "deployer", display_name="运维组", description="负责部署与监控",
               capabilities=["部署", "linux"])
-    resp = json.loads(server.register_agent.fn(
-        "auditor", display_name="隐身审计", description="只看不说话", hidden=True))
+    resp = json.loads(server.register_agent.fn("auditor", timezone="Asia/Shanghai", display_name="隐身审计", description="只看不说话", hidden=True))
     auditor_token = resp["token"]
 
     # 关键词搜索：隐身的不出现
@@ -233,8 +232,7 @@ def test_search_agents_and_hidden():
     os.environ.pop("MCPHARBOR_ADMIN_TOKEN", None)
 
     # 隐身只是不被搜到：知道 id 仍可私信，自己仍可用 token 读
-    fe_token = json.loads(server.register_agent.fn(
-        "fe-sender", display_name="发信方", description="给隐身者发信的测试身份"))["token"]
+    fe_token = json.loads(server.register_agent.fn("fe-sender", timezone="Asia/Shanghai", display_name="发信方", description="给隐身者发信的测试身份"))["token"]
     r = json.loads(asyncio.run(server.send_message.fn(
         from_agent="fe-sender", token=fe_token, to_agent="auditor", message="内部通报")))
     assert r["status"] == "ok"

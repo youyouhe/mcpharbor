@@ -32,8 +32,7 @@ def _setup():
 
 
 def _register(server, agent_id):
-    resp = json.loads(server.register_agent.fn(
-        agent_id, display_name=f"显示名-{agent_id}", description=f"E2E 优化测试身份 {agent_id}"))
+    resp = json.loads(server.register_agent.fn(agent_id, timezone="Asia/Shanghai", display_name=f"显示名-{agent_id}", description=f"E2E 优化测试身份 {agent_id}"))
     assert resp.get("status") == "ok", resp
     return resp["token"]
 

@@ -22,7 +22,7 @@ def _setup():
 
 
 def _register(server, agent_id, **kwargs):
-    resp = json.loads(server.register_agent.fn(agent_id, **kwargs))
+    resp = json.loads(server.register_agent.fn(agent_id, timezone="Asia/Shanghai", **kwargs))
     assert resp.get("status") == "ok", resp
     return resp["token"]
 
@@ -109,8 +109,7 @@ def test_register_agent_race_does_not_lie():
     original = store.create_agent_token
     store.create_agent_token = lambda *a, **k: False
 
-    resp = json.loads(server.register_agent.fn(
-        "race-agent", display_name="竞态测试", description="竞态测试身份，验证不撒谎"))
+    resp = json.loads(server.register_agent.fn("race-agent", timezone="Asia/Shanghai", display_name="竞态测试", description="竞态测试身份，验证不撒谎"))
     assert "error" in resp, resp
     assert "抢先注册" in resp["error"]
     print(f"✓ 底层写入失败时不会假装成功：{resp['error'][:40]}")

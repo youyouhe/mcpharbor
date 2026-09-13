@@ -17,10 +17,11 @@ from urllib.parse import quote
 import mcp.types as mcp_types
 from fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .models import (
-    AuditEntry, Berth, BerthStatus, Contract, ContractPin, DirectMessage, Manifest,
-    Notification, NotifyPriority, Subscription, Task, TaskStatus,
+    AuditEntry, Berth, BerthStatus, Contract, ContractPin, DirectMessage, HarborFile,
+    Manifest, Notification, NotifyPriority, Subscription, Task, TaskStatus,
 )
 from .storage import HarborStorage
 
@@ -61,6 +62,11 @@ async def _heartbeat_loop() -> None:
             await _sweep_stale_tasks()
         except Exception:
             pass  # 扫尾失败不影响心跳主职责，下一轮再试
+        try:
+            if (removed := _get_store().cleanup_expired_files()):
+                _audit("file.sweep", "system", "harbor", {"removed_files": removed})
+        except Exception:
+            pass  # 过期文件清理失败同理，下一轮再试
         await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
 
 
@@ -174,6 +180,66 @@ def _check_admin(admin_token: str) -> str | None:
     return None
 
 
+def _utc_now() -> datetime:
+    """当前 UTC 时间。open_session 的 timezone 参数会遮住 datetime.timezone，
+    函数体里取 UTC 一律走这个模块级助手，别再直接写 datetime.now(timezone.utc)。"""
+    return datetime.now(timezone.utc)
+
+
+def _validate_timezone(tz: str) -> str | None:
+    """校验 IANA 时区名。返回错误信息，通过则返回 None。
+
+    Harbor 的时间戳一律存 UTC；声明时区是为了让"我的本地几点"和 created_at 可换算，
+    避免 agent 拿本地钟点和 UTC 时间戳直接比大小得出错误结论。缩写（CST）和偏移
+    （GMT+8）歧义大、缺夏令时信息，只收 IANA 名。
+    """
+    tz = (tz or "").strip()
+    if not tz:
+        return ("timezone 必填：请声明你所在环境的 IANA 时区名（如 Asia/Shanghai、UTC、"
+                "America/New_York）。Harbor 的时间戳一律是 UTC，声明时区后各方才能把 "
+                "created_at 和本地时间正确换算，不会拿 12:46（本地）去和 04:34（UTC）比大小")
+    try:
+        ZoneInfo(tz)
+    except (ZoneInfoNotFoundError, ValueError, KeyError):
+        return (f"timezone={tz!r} 不是有效的 IANA 时区名（如 Asia/Shanghai、UTC、Europe/London）；"
+                "不要用 CST/GMT+8 这类缩写或偏移写法，它们有歧义且不含夏令时规则")
+    return None
+
+
+# ── 寄存文件（send_file/get_file/list_files）──
+
+_FILE_SIZE_HINT_THRESHOLD = 48_000  # 字节；超过时 send_message 响应带 hint 建议改用 send_file（照发不拦截）
+_PUSH_SUMMARY_LIMIT = 2_000         # 推送通知 summary 截断长度：全文进推送会刷爆在线 agent 的上下文
+
+
+def _human_size(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / 1024 / 1024:.1f} MB"
+
+
+def _trunc(s: str, limit: int = _PUSH_SUMMARY_LIMIT) -> str:
+    if len(s) <= limit:
+        return s
+    return s[:limit] + "…（已截断）"
+
+
+def _sanitize_filename(name: str) -> str:
+    """filename 只作展示（磁盘名是 file_id），但仍净化：防控制字符/路径分隔符/超长进库和通知文本。"""
+    name = "".join(c for c in name.strip() if not ord(c) < 32 and c not in "/\\")
+    return (name or "file.txt")[:255]
+
+
+def _file_notify_text(f: HarborFile) -> str:
+    text = (f"📎 文件：{f.filename}（{_human_size(f.size)}）file_id={f.id}，"
+            f"7 天内用 harbor.get_file(agent_id, token, file_id=\"{f.id}\") 取")
+    if f.note:
+        text += f"\n备注：{f.note}"
+    return text
+
+
 # 事件名：小写字母/数字开头结尾，中间允许点/连字符/下划线（如 user.created、e2e.ping）。
 # 不校验的话 notify/subscribe 随手填的字符串会进通知历史，订阅方按 event 匹配就乱套了。
 _EVENT_NAME_RE = re.compile(r"[a-z0-9]([a-z0-9._\-]*[a-z0-9])?")
@@ -204,6 +270,7 @@ def _collect_admin_overview() -> dict[str, Any]:
                 "display_name": a.display_name or "（未登记）",
                 "description": a.description or "（未登记）",
                 "contact": a.contact or "",
+                "timezone": a.timezone or "未声明",
                 "capabilities": "、".join(a.capabilities) if a.capabilities else "",
                 "created_at": a.created_at.isoformat(),
                 "last_seen": a.last_seen.isoformat() if a.last_seen else "从未活跃",
@@ -387,13 +454,14 @@ def _render_admin_html(data: dict[str, Any], mcp_url: str = "", admin_token: str
     agents_rows = _rows(
         [{"agent_id": a["agent_id"], "display_name": a["display_name"],
           "description": a["description"], "contact": a["contact"],
+          "timezone": a.get("timezone", ""),
           "capabilities": a.get("capabilities", ""),
           "created_at": a["created_at"], "last_seen": a["last_seen"],
           "heartbeat": a["heartbeat"],
           "online": "🟢 在线" if a["online"] else "⚪ 离线",
           "revoked": "已吊销" if a["revoked"] else "正常"}
          for a in data["agents"]],
-        ["agent_id", "display_name", "description", "capabilities", "contact", "created_at", "last_seen", "heartbeat", "online", "revoked"],
+        ["agent_id", "display_name", "description", "capabilities", "contact", "timezone", "created_at", "last_seen", "heartbeat", "online", "revoked"],
     )
     berths_rows = _rows(data["berths"], ["id", "owner", "version", "status", "capabilities", "contact"])
     subs_rows = _rows(data["subscriptions"], ["subscriber", "berth", "events", "version_range"])
@@ -441,12 +509,12 @@ def _render_admin_html(data: dict[str, Any], mcp_url: str = "", admin_token: str
     tools_card = """
 <div class="card connect" style="border-left-color:#16a34a;">
   <h2>🧰 工具清单与"没有工具"排查</h2>
-  <p class="hint" style="margin:0 0 0.6rem;">Harbor 共 <b>33 个工具</b>，实际暴露的工具名<b>不带 <code>harbor.</code> 前缀</b>（README 里的 <code>harbor.xxx</code> 只是文档写法）：<code>register_agent</code>、<code>rotate_token</code>、<code>publish_manifest</code>、<code>get_manifest</code>、<code>search_berths</code>、<code>subscribe</code>、<code>open_session</code>、<code>send_message</code>、<code>get_messages</code>、<code>mark_messages_read</code>、<code>get_conversations</code>、<code>search_agents</code>、<code>admin_command</code>、<code>admin_manage_agent</code>、<code>admin_manage_berth</code>、<code>admin_cleanup</code>、<code>notify</code>、<code>resolve_dependency</code>、<code>check_compat</code>、<code>pin_contract</code>、<code>unpin_contract</code>、<code>get_my_pins</code>、<code>create_task</code>、<code>update_task</code>、<code>get_task</code>、<code>list_tasks</code>、<code>cancel_task</code>、<code>ack_messages</code>、<code>check_updates</code>、<code>sync</code>、<code>diff_versions</code>、<code>get_notifications</code>、<code>get_audit_log</code>。</p>
+  <p class="hint" style="margin:0 0 0.6rem;">Harbor 共 <b>36 个工具</b>，实际暴露的工具名<b>不带 <code>harbor.</code> 前缀</b>（README 里的 <code>harbor.xxx</code> 只是文档写法）：<code>register_agent</code>、<code>rotate_token</code>、<code>publish_manifest</code>、<code>get_manifest</code>、<code>search_berths</code>、<code>subscribe</code>、<code>open_session</code>、<code>send_message</code>、<code>send_file</code>、<code>get_file</code>、<code>list_files</code>、<code>get_messages</code>、<code>mark_messages_read</code>、<code>get_conversations</code>、<code>search_agents</code>、<code>admin_command</code>、<code>admin_manage_agent</code>、<code>admin_manage_berth</code>、<code>admin_cleanup</code>、<code>notify</code>、<code>resolve_dependency</code>、<code>check_compat</code>、<code>pin_contract</code>、<code>unpin_contract</code>、<code>get_my_pins</code>、<code>create_task</code>、<code>update_task</code>、<code>get_task</code>、<code>list_tasks</code>、<code>cancel_task</code>、<code>ack_messages</code>、<code>check_updates</code>、<code>sync</code>、<code>diff_versions</code>、<code>get_notifications</code>、<code>get_audit_log</code>。</p>
   <p class="hint" style="margin:0;">如果某个 Agent 连上后说"只看到资源、没有工具"，问题几乎都在客户端侧，按概率排查：
     ① 客户端 MCP 实现残缺——不少网页聊天 Agent 只调 <code>resources/list</code> 不调 <code>tools/list</code>，能看到 <code>harbor://berths</code> 说明连接是通的；
     ② 按 <code>harbor.*</code> 前缀找工具——实际是裸名字；
     ③ transport/端点不匹配——streamable-http 端点是 <code>/mcp</code>，有的客户端只连 <code>/sse</code>。
-    服务端自检：用 fastmcp Client 连上来跑 <code>list_tools()</code>，能看到 33 个工具就说明问题在对方。</p>
+    服务端自检：用 fastmcp Client 连上来跑 <code>list_tools()</code>，能看到 36 个工具就说明问题在对方。</p>
   <p class="hint" style="margin:0.4rem 0 0;">📌 注册新规：<code>register_agent</code> 必须提交 <code>display_name</code>（显示名）和 <code>description</code>（身份用途），agent_id 仅限小写字母/数字/连字符；同一 agent_id 重复注册会被拒绝——一个 Agent 只需要一个身份。</p>
 </div>"""
 
@@ -577,7 +645,7 @@ code {{
 
 <div class="card">
 <h2>参与者（{len(data['agents'])}）</h2>
-<table><tr><th>agent_id</th><th>显示名</th><th>身份说明</th><th>联系方式</th><th>注册时间</th><th>最后活跃</th><th>心跳（每30s）</th><th>在线</th><th>状态</th></tr>{agents_rows}</table>
+<table><tr><th>agent_id</th><th>显示名</th><th>身份说明</th><th>联系方式</th><th>时区</th><th>注册时间</th><th>最后活跃</th><th>心跳（每30s）</th><th>在线</th><th>状态</th></tr>{agents_rows}</table>
 <p class="hint">🧹 「最后活跃」仅在 last_seen 机制上线（2026-09-11）之后才开始记录：此前的注册即使真的活跃过也显示"从未活跃"，不能作为废弃依据。识别僵尸请以最后活跃时间（机制上线后）+ 档案登记情况 + 你自己的实际使用记忆为准；清理用 MCP 工具 <code>admin_manage_agent</code>（action=revoke 吊销 / purge 彻底删除，purge 不可恢复，动手前确认）。</p>
 </div>
 
@@ -1245,6 +1313,7 @@ async def _notify_subscribers(
 def register_agent(
     agent_id: str, display_name: str, description: str,
     contact: str = "", capabilities: list[str] | None = None, hidden: bool = False,
+    timezone: str = "",
 ) -> str:
     """注册 Agent 身份，获取用于写操作的 token。
 
@@ -1252,6 +1321,8 @@ def register_agent(
     - agent_id：小写字母/数字/连字符组成的唯一标识（如 wangxiaoya）
     - display_name：显示名（如"王小丫"）
     - description：这个身份是干什么的、为什么需要它（一个 Agent 只需要注册一个身份）
+    - timezone：你所在环境的 IANA 时区名（如 Asia/Shanghai）——Harbor 的时间戳一律存 UTC，
+      声明时区后各方才能正确换算本地时间，不再混淆"本地 12:46"和"UTC 04:34"
     - contact：联系方式（可选）
     - capabilities：能力标签（可选，如 ["前端", "部署"]），供其他 Agent 通过 search_agents 找到你
     - hidden：隐身注册（可选，默认 false）。隐身 agent 不出现在 search_agents 结果里，
@@ -1259,6 +1330,7 @@ def register_agent(
 
     每个 agent_id 只能注册一次；token 只在本次调用中返回一次，请妥善保存。
     若已注册会直接拒绝——不要换名字重复注册，需要更换 token 请用 rotate_token。
+    时区声明错了不用重注册：之后调 open_session 时带上 timezone 参数即可更正。
     """
     store = _get_store()
     if agent_id in _RESERVED_AGENT_IDS:
@@ -1284,11 +1356,17 @@ def register_agent(
                      f"如需更换 token 请调用 harbor.rotate_token",
         }, ensure_ascii=False)
 
+    tz = (timezone or "").strip()
+    tz_err = _validate_timezone(tz)
+    if tz_err:
+        return json.dumps({"error": tz_err}, ensure_ascii=False)
+
     token = _generate_token()
     created = store.create_agent_token(
         agent_id, _hash_token(token),
         display_name=display_name, description=description,
         contact=contact.strip(), capabilities=capabilities or [], hidden=hidden,
+        timezone_name=tz,
     )
     if not created:
         # 竞态：两个并发请求都通过了上面的"未注册"检查，数据库层唯一约束拦住了后来者。
@@ -1299,18 +1377,21 @@ def register_agent(
     _audit("agent.register", agent_id, f"agent:{agent_id}", {
         "display_name": display_name, "description": description,
         "contact": contact.strip(), "capabilities": capabilities or [],
-        "hidden": hidden,
+        "hidden": hidden, "timezone": tz,
     })
 
     return json.dumps({
         "status": "ok",
         "agent_id": agent_id,
         "display_name": display_name,
+        "timezone": tz,
         "token": token,
         "message": ("⚠️ 请立即把 token 写入文件保存（如 ~/.harbor/token 或项目内的私密配置），"
                     "不要只留在对话里——本次返回之后不会再显示，下次会话/新进程拿不到对话记忆。"
                     "所有写操作都要带它。若彻底丢失：rotate_token 也需要旧 token，无法自助找回，"
-                    "只能请 admin purge 掉这个身份（连带清掉全部私信）后重新注册。"),
+                    "只能请 admin purge 掉这个身份（连带清掉全部私信）后重新注册。"
+                    f"时间戳提醒：Harbor 全部时间戳都是 UTC（你声明了 {tz}），"
+                    "读消息时先把 created_at 换算成你的本地时间再和本地钟点比较。"),
     }, ensure_ascii=False)
 
 
@@ -1524,14 +1605,28 @@ def subscribe(
 
 
 @mcp.tool()
-def open_session(agent_id: str, token: str = "", ctx: Context | None = None) -> str:
+def open_session(agent_id: str, token: str = "", timezone: str = "", ctx: Context | None = None) -> str:
     """在不订阅任何 berth 的情况下，把当前连接注册为 agent_id 的存活会话。
 
     仅用于希望接收 harbor.send_message 私信原生推送、但不关心 berth 契约变更的场景。
+
+    - timezone（可选）：更正你声明的 IANA 时区。注册时已经声明过的不用每次传；
+      只有时区声明错了/换了环境（如换了机器）才需要带上。
+    - 返回的 server_time 是 Harbor 当前的 UTC 时间，可用它校验你本地时钟有没有偏差——
+      排查"消息为什么没读到"时先看时间基准是否对得上。
     """
     auth_err = _check_auth(agent_id, token)
     if auth_err:
         return json.dumps({"error": auth_err}, ensure_ascii=False)
+
+    tz_note = ""
+    tz = (timezone or "").strip()
+    if tz:
+        tz_err = _validate_timezone(tz)
+        if tz_err:
+            return json.dumps({"error": tz_err}, ensure_ascii=False)
+        _get_store().update_agent_timezone(agent_id, tz)
+        tz_note = f"，时区声明已更新为 {tz}"
 
     if ctx is not None:
         _live_sessions[agent_id] = ctx.session
@@ -1539,7 +1634,8 @@ def open_session(agent_id: str, token: str = "", ctx: Context | None = None) -> 
     return json.dumps({
         "status": "ok",
         "agent_id": agent_id,
-        "message": f"{agent_id} 的会话已注册，可接收原生推送。",
+        "server_time": _utc_now().isoformat(),
+        "message": f"{agent_id} 的会话已注册，可接收原生推送{tz_note}。",
     }, ensure_ascii=False)
 
 
@@ -1616,19 +1712,26 @@ async def send_message(
         pushed = await _push_notification(
             to, f"harbor://messages/{to}",
             change_type="direct_message", from_agent=from_agent, to_agent=to,
-            berth=berth, correlation_id=correlation_id, severity=severity, summary=message,
+            berth=berth, correlation_id=correlation_id, severity=severity,
+            summary=_trunc(message),  # 推送 summary 截断：在线 agent 的上下文不该被全文刷爆
         )
         results.append({"to": to, "message_id": msg.id, "pushed": pushed})
 
     pushed_count = sum(1 for r in results if r["pushed"])
-    return json.dumps({
+    resp: dict[str, Any] = {
         "status": "ok",
         "sent": len(results),
         "pushed": pushed_count,
         "results": results,
         "message": (f"已发送给 {len(results)} 个 agent"
                     + (f"（{pushed_count} 个在线已原生推送）" if pushed_count else "（对方不在线，等待其轮询收件箱）")),
-    }, ensure_ascii=False)
+    }
+    # 大文本软提示（照发不拦截）：文件类内容走 send_file 寄存，正文只发 file_id
+    if len(message.encode("utf-8")) > _FILE_SIZE_HINT_THRESHOLD:
+        resp["hint"] = (f"消息较大（{_human_size(len(message.encode('utf-8')))}），全文会进所有收件人的"
+                        "上下文（多播放大 N 倍）。若这是文件内容，建议改用 harbor.send_file 寄存，"
+                        "正文只发 file_id 和说明。")
+    return json.dumps(resp, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -1657,6 +1760,166 @@ def get_messages(
 
 
 @mcp.tool()
+async def send_file(
+    from_agent: str,
+    token: str = "",
+    filename: str = "",
+    content: str = "",
+    to_agent: str = "",
+    to_agents: list[str] | None = None,
+    correlation_id: str = "",
+    note: str = "",
+    severity: str = "normal",
+) -> str:
+    """寄存文件并发短通知给指定 agent（传脚本/配置/文档用这个，别把全文塞进 send_message）。
+
+    与 send_message 的区别：内容只落盘一份（harbor_files/，7 天后自动清理），每个收件人
+    收到的只是带 file_id 的短通知，收件方用 harbor.get_file 按权限拉取——多播 N 人不会
+    存 N 份全文，推送和上下文也不会被文件内容刷爆。可见性与私信相同：只有收发双方能取。
+
+    - filename：原始文件名（仅展示；磁盘上以 file_id 命名，路径无关）
+    - content：文本内容（脚本/配置/markdown 等；大小不设限，但内容会整体进内存，别传 GB 级）
+    - to_agent / to_agents：收件人，用法与 send_message 相同（可多播、可发给自己）
+    - correlation_id：话题串联号（如与某任务/消息线同线程）
+    - note：给收件人的说明（用法、注意事项），会出现在通知正文里
+    """
+    store = _get_store()
+
+    auth_err = _check_auth(from_agent, token)
+    if auth_err:
+        _audit("auth.denied", from_agent, "agent:unknown", {"reason": auth_err})
+        return json.dumps({"error": auth_err}, ensure_ascii=False)
+
+    recipients = list(to_agents or [])
+    if to_agent:
+        recipients.append(to_agent)
+    recipients = [r for i, r in enumerate(recipients) if r not in recipients[:i]]
+    if not recipients:
+        return json.dumps({"error": "请提供收件人：to_agent 或 to_agents 至少一个有效 agent_id"}, ensure_ascii=False)
+
+    recipient_errors = [e for r in recipients if (e := _check_recipient(store, r)) is not None]
+    if recipient_errors:
+        return json.dumps({"error": "；".join(recipient_errors)}, ensure_ascii=False)
+
+    try:
+        pri = NotifyPriority(severity)
+    except ValueError:
+        pri = NotifyPriority.NORMAL
+
+    safe_name = _sanitize_filename(filename)
+    content_bytes = content.encode("utf-8")
+    f = HarborFile(
+        filename=safe_name, size=len(content_bytes),
+        sha256=hashlib.sha256(content_bytes).hexdigest(),
+        sender=from_agent, recipients=recipients, note=note[:2000],
+        correlation_id=correlation_id, severity=pri,
+    )
+    try:
+        store.save_file(f, content)  # 先盘后库：写盘失败时不落库、不发通知
+    except OSError as exc:
+        return json.dumps({"error": f"文件写入失败：{exc}"}, ensure_ascii=False)
+
+    notify_text = _file_notify_text(f)
+    results = []
+    for to in recipients:
+        msg = DirectMessage(
+            from_agent=from_agent, to_agent=to, message=notify_text,
+            correlation_id=correlation_id or f.id, severity=pri,
+        )
+        store.add_message(msg)
+        # 审计只记元数据，绝不写 content（与 message.send 的隐私约定一致）
+        _audit("file.send", from_agent, f"agent:{to}", {
+            "file_id": f.id, "filename": f.filename, "size": f.size,
+            "correlation_id": correlation_id,
+        })
+        pushed = await _push_notification(
+            to, f"harbor://messages/{to}",
+            change_type="direct_message", from_agent=from_agent, to_agent=to,
+            correlation_id=correlation_id, severity=pri.value,
+            summary=f"来自 {from_agent} 的文件：{f.filename}（{_human_size(f.size)}），file_id={f.id}",
+        )
+        results.append({"to": to, "message_id": msg.id, "pushed": pushed})
+
+    pushed_count = sum(1 for r in results if r["pushed"])
+    return json.dumps({
+        "status": "ok",
+        "file_id": f.id, "filename": f.filename, "size": f.size, "sha256": f.sha256,
+        "expires_at": f.expires_at.isoformat(),
+        "sent": len(results), "pushed": pushed_count,
+        "results": results,
+        "message": (f"文件已寄存（{_human_size(f.size)}，7 天有效），通知发送给 {len(results)} 个 agent"
+                    + (f"（{pushed_count} 个在线已原生推送）" if pushed_count else "")),
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+def get_file(agent_id: str, token: str = "", file_id: str = "") -> str:
+    """取寄存文件（send_file 发来的短通知里带 file_id）。只有发件人和收件人能取。
+
+    返回 filename/size/sha256/content/expires_at 和已取记录；校验内容完整性可用
+    sha256 对照。文件 7 天过期，过期后即使库里有记录也无法再取。
+    """
+    store = _get_store()
+
+    auth_err = _check_auth(agent_id, token)
+    if auth_err:
+        _audit("auth.denied", agent_id, f"file:{file_id}", {"reason": auth_err})
+        return json.dumps({"error": auth_err}, ensure_ascii=False)
+
+    if not file_id:
+        return json.dumps({"error": "file_id 未提供：send_file 发来的通知里有 file_id"}, ensure_ascii=False)
+    meta = store.get_file_meta(file_id)
+    # "不存在"和"无权取"不区分措辞——区分了等于告诉探测者某个 file_id 真实存在
+    if meta is None or (agent_id != meta.sender and agent_id not in meta.recipients):
+        _audit("auth.denied", agent_id, f"file:{file_id}", {"reason": "非当事人"})
+        return json.dumps({"error": f"file_id={file_id} 不存在或你不是其收发双方"}, ensure_ascii=False)
+    if meta.expires_at <= datetime.now(timezone.utc):
+        return json.dumps({"error": f"file_id={file_id} 已过期（{meta.expires_at.isoformat()}）被清理，请让 {meta.sender} 重发"}, ensure_ascii=False)
+    content = store.read_file_content(file_id)
+    if content is None:
+        return json.dumps({"error": f"file_id={file_id} 的内容已丢失（可能被清理），请让 {meta.sender} 重发"}, ensure_ascii=False)
+
+    store.touch_file_fetch(file_id, agent_id)
+    _audit("file.get", agent_id, f"file:{file_id}", {
+        "filename": meta.filename, "size": meta.size, "sender": meta.sender,
+    })
+    return json.dumps({
+        "status": "ok",
+        "file_id": meta.id, "filename": meta.filename, "size": meta.size,
+        "sha256": meta.sha256, "content": content,
+        "expires_at": meta.expires_at.isoformat(),
+        "fetched": meta.fetched + [{"agent_id": agent_id,
+                                    "at": datetime.now(timezone.utc).isoformat()}],
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+def list_files(agent_id: str, token: str = "") -> str:
+    """列出我发送或接收的未过期寄存文件（含谁取过、取了几次），不含内容。"""
+    store = _get_store()
+
+    auth_err = _check_auth(agent_id, token)
+    if auth_err:
+        return json.dumps({"error": auth_err}, ensure_ascii=False)
+
+    files = [
+        {
+            "file_id": f.id, "filename": f.filename, "size": f.size,
+            "sender": f.sender,
+            "direction": "sent" if f.sender == agent_id else "received",
+            "recipients": f.recipients, "correlation_id": f.correlation_id,
+            "note": f.note,
+            "created_at": f.created_at.isoformat(),
+            "expires_at": f.expires_at.isoformat(),
+            "fetch_count": len(f.fetched),
+        }
+        for f in store.list_files_for(agent_id)
+    ]
+    return json.dumps({"status": "ok", "count": len(files), "files": files},
+                      ensure_ascii=False)
+
+
+@mcp.tool()
 def mark_messages_read(agent_id: str, token: str = "", message_ids: list[str] | None = None) -> str:
     """把发给自己的私信标记为已读，方便下次只拉取新消息（unread_only=True）。"""
     store = _get_store()
@@ -1680,6 +1943,10 @@ def get_conversations(agent_id: str, token: str = "") -> str:
     典型用法：先 get_conversations 看谁发了什么、几条没读，
     再用 get_messages(with_agent=...) 展开需要的对话，mark_messages_read 标记已读。
     有未读的对话排在最前面。
+
+    返回里的 server_time 是 Harbor 当前的 UTC 时间——消息的 created_at 也都是 UTC。
+    判断"消息几点到的"先拿 server_time 对表，再把 created_at 换算成你的本地时区比较，
+    不要拿本地钟点直接和 UTC 时间戳比（会差出整时区）。
     """
     store = _get_store()
 
@@ -1693,6 +1960,9 @@ def get_conversations(agent_id: str, token: str = "") -> str:
         "conversations": convs,
         "count": len(convs),
         "unread_total": total_unread,
+        # 时间基准锚点：conversations 里的 created_at 都是 UTC，拿 server_time 对表，
+        # 别再拿本地钟点直接和 UTC 时间戳比（会差出整时区，得出"消息还没到"的错误结论）
+        "server_time": datetime.now(timezone.utc).isoformat(),
     }, ensure_ascii=False, default=str)
 
 
@@ -1702,7 +1972,8 @@ def search_agents(keyword: str = "", capability: str = "") -> str:
 
     结果不含 token、不含隐身（hidden）注册、不含已吊销身份。
     keyword 匹配 agent_id/显示名/描述/联系方式/能力标签；capability 精确匹配能力标签。
-    要找"谁能干某件事"而不是"哪个项目提供某契约"时用这个（找项目用 search_berths）。
+    名片里的 timezone 是对方声明的 IANA 时区（判断对方现在是工作时间还是深夜），
+    last_seen 是 UTC。要找"谁能干某件事"而不是"哪个项目提供某契约"时用这个（找项目用 search_berths）。
     """
     store = _get_store()
     agents = store.search_agents(keyword=keyword or "", capability=capability or "")
@@ -1718,6 +1989,8 @@ def search_agents(keyword: str = "", capability: str = "") -> str:
             "description": a.description or "（未登记）",
             "capabilities": a.capabilities,
             "contact": a.contact,
+            # 对方的声明时区：判断"对方现在是工作时间还是深夜"用（旧注册可能未声明）
+            "timezone": a.timezone or "",
             "online": a.agent_id in _live_sessions,
             "last_seen": a.last_seen.isoformat() if a.last_seen else "",
         }
@@ -1900,16 +2173,22 @@ def admin_cleanup(
     store = _get_store()
     removed_msgs = store.cleanup_old_messages(message_retention_days)
     removed_notifs = store.cleanup_old_notifications(notification_retention_days)
+    # 寄存文件按各自的 expires_at 绝对时间清（7 天寿命在 send_file 时就定了），
+    # 与私信/通知的"保留天数"语义不同，所以不吃这两个参数。
+    removed_files = store.cleanup_expired_files()
     _audit("admin.cleanup", "admin", "harbor", {
         "removed_messages": removed_msgs,
         "removed_notifications": removed_notifs,
+        "removed_files": removed_files,
         "message_retention_days": message_retention_days,
     })
     return json.dumps({
         "status": "ok",
         "removed_messages": removed_msgs,
         "removed_notifications": removed_notifs,
-        "message": f"已清理 {removed_msgs} 条过期私信、{removed_notifs} 条过期通知。",
+        "removed_files": removed_files,
+        "message": (f"已清理 {removed_msgs} 条过期私信、{removed_notifs} 条过期通知、"
+                    f"{removed_files} 个过期寄存文件。"),
     }, ensure_ascii=False)
 
 
