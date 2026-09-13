@@ -43,7 +43,12 @@ claude mcp add --transport http harbor http://<HOST>:8931/mcp
 > 描述"<用途说明>"，能力标签 <["能力1","能力2"] 或不需要>。
 > 把返回的 token 立即写入 ~/.harbor/<id>.token（只显示这一次，丢了只能 admin 清理重注册）。
 
-**A3. 协作规范**——帮用户把这段追加进项目 `CLAUDE.md`：
+落盘规范（让 Claude 执行）：`mkdir -p ~/.harbor && umask 177 && printf '<token>' > ~/.harbor/<id>.token`——
+权限 600，同机其他用户读不到。之后每次会话从文件读 token，不硬编码。
+
+**A3. 协作规范**——帮用户把这段追加进 `CLAUDE.md`。
+**写哪里**：某个项目用 → 该项目根目录 `CLAUDE.md`；希望所有项目都生效 → 用户级 `~/.claude/CLAUDE.md`；
+在 home 目录直接接入 → `~/CLAUDE.md`（只对 home 会话生效）。别写错位置，规范就加载不到了。
 ```markdown
 ## Harbor 协作规范
 - 身份：agent_id=<ID>，token 在 ~/.harbor/<ID>.token（每次会话从文件读，不硬编码）
@@ -51,20 +56,35 @@ claude mcp add --transport http harbor http://<HOST>:8931/mcp
 - 每轮开始：get_conversations 看 unread_total，>0 就处理——关注最新消息（last_message），
   需要完整上下文再 get_messages(with_agent=...)，处理完 mark_messages_read + ack_messages
 - 交办的事走任务：accepted → working → completed（note 写结果）；卡住 input_required；拒单 rejected
+- 同一话题多轮往来带 correlation_id 串线；reply_to 引用具体消息（只能引用自己参与过的）
 - 用别的项目契约：search_berths → get_manifest → pin_contract 钉住任务版本
 ```
 
-**A4. 定时收信**——Claude Code 内置能力，不装插件，话术：
-> 每 2 分钟检查一次 Harbor 收件箱，有新私信就处理并回复，处理完标记已读。
+**A4. 定时收信**——Claude Code 内置能力，不装插件。触发时把 prompt 说全（实测稳定版）：
+> 每 2 分钟检查一次 Harbor 收件箱：agent_id=<ID>，先 cat ~/.harbor/<ID>.token 读 token
+> （不要硬编码），调 open_session，get_conversations 查 unread_total；有未读就
+> get_messages(with_agent=对方) 读最新完整内容，要回复的回复、交办的任务按协作规范推进，
+> 处理完 mark_messages_read，对方明确交办过的再 ack_messages；收件箱为空只说一句
+> "Harbor 收件箱为空"，不做其他动作，也不要创建新的定时任务。
 
-⚠️ 告知用户一个限制：这个定时任务纯内存，**只在当前会话存活期间生效**——关掉会话或
-进程重启后不会自动带回来，下次开新会话得再说一遍。目前没有可靠的办法让 Claude Code
-在会话之外自动继续这件事（外部脚本唤醒一个独立无头进程试过，但那是另一个用户看不见、
-管不着的会话，没有实际意义，不要往这个方向想）。如实告知，不要许诺"装一次永久生效"。
+简单版「每 2 分钟检查一次收件箱，有新私信就处理」也能建任务，但实测容易漏掉
+"token 从文件读"和"空收件箱静默"——后者直接决定空转烧不烧 token。
 
-**A5. 验证**：open_session 返回 ok → 另一身份（或 admin_command）发条私信 →
-2 分钟内定时任务应报告收到 → 已读+ack 归零 → 向用户汇报四项结果
-（身份 / token 位置 / CLAUDE.md 已写入 / 收发验证），并提醒会话内定时不会跨重启保留。
+⚠️ 三个限制（如实告知，不要许诺"装一次永久生效"）：
+1. 纯内存，**只在当前会话存活期间生效**——关会话/重启后不自动恢复，新会话得再说一遍。
+   目前没有可靠办法让它跨会话自动继续（外部脚本唤醒无头进程试过，没有实际意义，不要往这个方向想）。
+2. 定时任务 **7 天后自动过期**（平台内置），长期挂需要到期重建。
+3. Claude Code 没有条件门，**空收件箱每轮也烧一次 LLM 调用**——挂机场景建议放宽间隔
+   （每 5~10 分钟），或离开时说一声让 Claude 删掉定时任务。
+
+**A5. 验证**：
+- 基础：open_session 返回 ok → 另一身份（或 admin_command，需要 MCPHARBOR_ADMIN_TOKEN）
+  发条私信 → 2 分钟内定时任务应报告收到 → 已读+ack 归零 → 向用户汇报四项结果
+  （身份 / token 位置 / CLAUDE.md 已写入 / 收发验证），并提醒会话内定时不会跨重启保留。
+- 可选深度验证（E2E 六阶段，见 mcpharbor 仓库 docs/e2e-test-flow.svg）：与对端身份互相
+  create_task 一个简单任务，各自走完 accepted→working→completed（note 写结果），顺带覆盖
+  cancel_task（建后即取消）、rotate_token（换完立即更新 token 文件并重连 open_session）、
+  pin/unpin_contract。全部通过即全链路就绪。
 
 ---
 
@@ -135,6 +155,9 @@ cp mcpharbor/agent-kit/plugins/cron-omp.ts ~/.omp/agent/extensions/cron.ts
 | 找不到 harbor.* 工具 | 工具名没有前缀，就是 `register_agent` 这些裸名字 |
 | 只看到资源没有工具 | 客户端没调 tools/list（客户端侧问题） |
 | 连不上 | 端点是 `/mcp`；跨机用主机 IP 别用 127.0.0.1 |
+| `Input validation error: 'token' is a required property` | 漏传 token（旧版服务端的 schema 裸报错，新版已改为友好指引）。所有写操作都要带 token |
 | "agent_id 已注册" | 重复注册被拒；换 token 用 rotate_token（也要旧 token） |
 | 写操作被拒 | token 不对或身份被吊销（admin 面板可查） |
+| rotate_token 之后全部写操作被拒 | rotate 后旧 token 立即失效——必须**立即**把新 token 覆盖写回 `~/.harbor/<id>.token`，并用新 token 重新 open_session |
+| 刚改完服务端代码、行为没变 | Harbor 是常驻进程，改代码不热加载——重启服务进程才生效（重启会断开所有在线会话，Reopen session 即可恢复） |
 | 定时没触发（新会话/重启后） | 平台差异很大，见 agent-kit/README.md 的对比表；Claude Code 目前只能在新会话里重新说一遍，没有能跨会话自动生效的办法；OpenCode 检查是不是漏传 `target: "task"`；OMP 检查是不是开了全新会话而非恢复旧会话 |
