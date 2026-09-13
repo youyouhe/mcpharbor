@@ -113,7 +113,8 @@ class HarborStorage:
                 severity TEXT NOT NULL DEFAULT 'normal',
                 kind TEXT NOT NULL DEFAULT 'chat',
                 created_at TEXT NOT NULL,
-                read INTEGER NOT NULL DEFAULT 0
+                read INTEGER NOT NULL DEFAULT 0,
+                read_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS contract_pins (
@@ -186,6 +187,8 @@ class HarborStorage:
             conn.execute("ALTER TABLE messages ADD COLUMN acked_at TEXT")
         if "kind" not in msg_cols:
             conn.execute("ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'chat'")
+        if "read_at" not in msg_cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN read_at TEXT")
         conn.commit()
 
     # ── Berth CRUD ──
@@ -637,6 +640,8 @@ class HarborStorage:
             severity=NotifyPriority(r["severity"]),
             kind=r["kind"] if "kind" in r.keys() else "chat",
             created_at=datetime.fromisoformat(r["created_at"]), read=bool(r["read"]),
+            read_at=datetime.fromisoformat(r["read_at"])
+            if r["read_at"] not in (None, "") and "read_at" in r.keys() else None,
             acked=bool(r["acked"]) if "acked" in r.keys() else False,
             acked_at=datetime.fromisoformat(r["acked_at"]) if r["acked_at"] not in (None, "") else None
             if "acked_at" in r.keys() else None,
@@ -646,12 +651,14 @@ class HarborStorage:
         conn = self._get_conn()
         conn.execute("""
             INSERT INTO messages (id, from_agent, to_agent, berth, message,
-                correlation_id, reply_to, severity, kind, created_at, read, acked, acked_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                correlation_id, reply_to, severity, kind, created_at, read, read_at, acked, acked_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             msg.id, msg.from_agent, msg.to_agent, msg.berth, msg.message,
             msg.correlation_id, msg.reply_to, msg.severity.value, msg.kind,
-            msg.created_at.isoformat(), int(msg.read), int(msg.acked),
+            msg.created_at.isoformat(), int(msg.read),
+            msg.read_at.isoformat() if msg.read_at else None,
+            int(msg.acked),
             msg.acked_at.isoformat() if msg.acked_at else None,
         ))
         conn.commit()
@@ -738,14 +745,75 @@ class HarborStorage:
         entries.sort(key=lambda e: e["unread"], reverse=True)
         return entries
 
-    def mark_messages_read(self, agent_id: str, message_ids: list[str]) -> int:
-        """只能标记发给自己（to_agent=agent_id）的私信为已读。"""
+    # ── 会话时序图（admin 面板 /admin/timeline 取数）──
+
+    def get_message_pairs(self, limit: int = 100) -> list[dict[str, Any]]:
+        """管理视角：全库按 agent 对聚合的会话列表。
+
+        MIN/MAX 双参标量形式把 (A→B) 和 (B→A) 归一成同一个无向对，双向往来合为一行；
+        计数上 chat 与 task_event/admin_command 分开——会话列表的主线是真人往来，
+        任务回执只是噪音但有 ack 统计价值。
+        """
         conn = self._get_conn()
+        rows = conn.execute(
+            """
+            SELECT MIN(from_agent, to_agent) AS a, MAX(from_agent, to_agent) AS b,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN kind='chat' THEN 1 ELSE 0 END) AS chat_n,
+                   SUM(acked) AS acked_n,
+                   MIN(created_at) AS first_at, MAX(created_at) AS last_at
+            FROM messages
+            GROUP BY a, b
+            ORDER BY last_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_pair_messages(self, agent_a: str, agent_b: str, limit: int = 500) -> list[DirectMessage]:
+        """取一对 agent 之间的全部私信（双向），按时间正序——时序图要从早画到晚。"""
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT * FROM messages
+               WHERE (from_agent=? AND to_agent=?) OR (from_agent=? AND to_agent=?)
+               ORDER BY created_at ASC, id ASC LIMIT ?""",
+            (agent_a, agent_b, agent_b, agent_a, limit),
+        ).fetchall()
+        return [self._row_to_message(r) for r in rows]
+
+    def get_messages_by_correlation(self, correlation_ids: list[str], limit: int = 500) -> list[DirectMessage]:
+        """按 correlation_id 集合取消息（任务线：task_event 串 task.id，用户消息串自填值），时间正序。"""
+        if not correlation_ids:
+            return []
+        conn = self._get_conn()
+        placeholders = ",".join("?" for _ in correlation_ids)
+        rows = conn.execute(
+            f"SELECT * FROM messages WHERE correlation_id IN ({placeholders}) "
+            f"ORDER BY created_at ASC, id ASC LIMIT ?",
+            (*correlation_ids, limit),
+        ).fetchall()
+        return [self._row_to_message(r) for r in rows]
+
+    def get_tasks_by_key(self, key: str) -> list[Task]:
+        """任务/correlation_id 双模匹配：key 可能是 task.id，也可能是用户自填的 correlation_id。"""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE id=? OR correlation_id=? ORDER BY created_at ASC",
+            (key, key),
+        ).fetchall()
+        return [self._row_to_task(r) for r in rows]
+
+    def mark_messages_read(self, agent_id: str, message_ids: list[str]) -> int:
+        """只能标记发给自己（to_agent=agent_id）的私信为已读。同时落 read_at 锚点
+        （时序图画"发出→被读"时延用；重复标记不覆盖第一次的已读时间）。"""
+        conn = self._get_conn()
+        now = datetime.now(timezone.utc).isoformat()
         count = 0
         for mid in message_ids:
             cur = conn.execute(
-                "UPDATE messages SET read=1 WHERE id=? AND to_agent=?",
-                (mid, agent_id),
+                "UPDATE messages SET read=1, read_at=COALESCE(read_at, ?) WHERE id=? AND to_agent=?",
+                (now, mid, agent_id),
             )
             count += cur.rowcount
         conn.commit()

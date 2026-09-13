@@ -131,6 +131,9 @@ class DirectMessage(BaseModel):
     kind: str = "chat"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     read: bool = False
+    # 首次标记已读的时间（read 只知道"读没读"，时序图要画"发出去多久才被读"就得有这个锚点；
+    # 旧数据该列为 NULL，前端显示"未知"不画已读时延段）
+    read_at: datetime | None = None
     # ack = 收件方明确确认"收到并认领"（比已读更强：已读只代表看到，ack 代表对这个消息负责）
     acked: bool = False
     acked_at: datetime | None = None

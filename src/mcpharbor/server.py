@@ -12,6 +12,7 @@ import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import quote
 
 import mcp.types as mcp_types
 from fastmcp import Context, FastMCP
@@ -246,7 +247,134 @@ def _collect_admin_overview() -> dict[str, Any]:
     }
 
 
-def _render_admin_html(data: dict[str, Any], mcp_url: str = "") -> str:
+# ═══════════════════════════════════════════════════════════════════
+#  会话时序图（/admin/timeline）— 数据组装
+#  Chrome DevTools Network 式瀑布图：时间点 + 时延。时延没有现成字段，
+#  全部由相邻时间戳推：消息 ack/read 的等待时长、任务 created→终态的持续段。
+# ═══════════════════════════════════════════════════════════════════
+
+_TASK_TERMINAL_STATUSES = {"completed", "failed", "canceled", "rejected"}
+
+
+def _iso(dt: datetime | None) -> str | None:
+    return dt.isoformat() if dt else None
+
+
+def _wait_ms(start: datetime, end: datetime | None) -> int | None:
+    """start→end 的等待毫秒数；end 未知（未 ack / 旧数据 read_at 为空）返回 None，前端不画段。"""
+    if end is None or end < start:
+        return None
+    return int((end - start).total_seconds() * 1000)
+
+
+def _timeline_record_message(m: DirectMessage, lane: str) -> dict[str, Any]:
+    """消息 → 统一事件 record。泳道=发送方；ack/read 等待时长在服务端算好毫秒，前端只管布局。"""
+    return {
+        "id": m.id,
+        "type": "message",
+        "ts": _iso(m.created_at),
+        "ts_end": _iso(m.acked_at),  # ack 等待延伸段的终点；未 ack → null，纯时间点
+        "lane": lane,
+        "from": m.from_agent,
+        "to": m.to_agent,
+        "kind": m.kind,
+        "severity": m.severity.value,
+        "text": m.message,
+        "correlation_id": m.correlation_id,
+        "read": m.read,
+        "acked": m.acked,
+        "latency": {
+            "read_wait_ms": _wait_ms(m.created_at, m.read_at),
+            "ack_wait_ms": _wait_ms(m.created_at, m.acked_at),
+        },
+    }
+
+
+def _timeline_record_task(task: Task, store: HarborStorage) -> dict[str, Any]:
+    """任务 → 统一事件 record：主条 created_at→终态时间，状态转移刻度从审计序列推。
+
+    任务状态转移本身没有独立存储，转移时间只能从 audit_log 的 task.create/update/cancel/sweep
+    序列取；审计 90 天清理（storage.cleanup_old_audit）意味着老任务的刻度可能不全——
+    终态时间兜底用 tasks.updated_at（每次状态写入都会刷它）。
+    """
+    entries = [e for e in store.get_audit_log(limit=500, task_id=task.id)
+               if e.target == f"task:{task.id}"]
+    entries.sort(key=lambda e: e.timestamp)
+    ticks = []
+    for e in entries:
+        # detail 键随 action 而异：task.update 用 "to" 记新状态（server.py update_task）
+        new_status = e.detail.get("to") or e.detail.get("status", "")
+        if e.action == "task.create":
+            label = "创建"
+        elif e.action == "task.sweep":
+            label = "超时扫尾→failed"
+        elif new_status:
+            label = f"→ {new_status}"
+        else:
+            label = e.action
+        ticks.append({"ts": _iso(e.timestamp), "label": label,
+                      "action": e.action, "actor": e.actor})
+    end = max([e.timestamp for e in entries], default=task.updated_at)
+    if end < task.updated_at:
+        end = task.updated_at
+    is_terminal = task.status.value in _TASK_TERMINAL_STATUSES
+    return {
+        "id": task.id,
+        "type": "task",
+        "ts": _iso(task.created_at),
+        "ts_end": _iso(end),
+        "open": not is_terminal,  # 未终态：前端把条画成右端开放的延伸样式
+        "lane": f"task:{task.id}",
+        "status": task.status.value,
+        "title": task.title,
+        "creator": task.creator,
+        "assignee": task.assignee,
+        "correlation_id": task.correlation_id,
+        "result": task.result,
+        "deadline": task.deadline,
+        "ticks": ticks,
+    }
+
+
+def _build_timeline_payload(mode: str, key: str = "", limit: int = 500) -> dict[str, Any]:
+    """时序图 API 的取数组装。mode=list 会话/任务列表；mode=pair 按 agent 对；mode=task 按任务/correlation。"""
+    store = _get_store()
+    if mode == "list":
+        return {
+            "mode": "list",
+            "pairs": [
+                {"a": p["a"], "b": p["b"], "total": p["total"],
+                 "chat_n": p["chat_n"] or 0, "acked_n": p["acked_n"] or 0,
+                 "first_at": p["first_at"], "last_at": p["last_at"]}
+                for p in store.get_message_pairs(limit=100)
+            ],
+            "tasks": [
+                {"id": t.id, "title": t.title, "status": t.status.value,
+                 "creator": t.creator, "assignee": t.assignee,
+                 "correlation_id": t.correlation_id,
+                 "created_at": _iso(t.created_at), "updated_at": _iso(t.updated_at)}
+                for t in store.list_all_tasks(limit=50)
+            ],
+        }
+    if mode == "pair":
+        # key 形如 "a|b"（agent_id 限小写字母/数字/连字符，不含 |，安全分隔）
+        agent_a, _, agent_b = key.partition("|")
+        msgs = store.get_pair_messages(agent_a, agent_b, limit=limit)
+        events = [_timeline_record_message(m, lane=m.from_agent) for m in msgs]
+        return {"mode": "pair", "a": agent_a, "b": agent_b,
+                "events": events, "truncated": len(msgs) >= limit}
+    # mode == "task"
+    tasks = store.get_tasks_by_key(key)
+    related_ids = {key} | {t.id for t in tasks}
+    events: list[dict[str, Any]] = [_timeline_record_task(t, store) for t in tasks]
+    msgs = store.get_messages_by_correlation(sorted(related_ids), limit=limit)
+    # 相关消息（chat 串自填 correlation、task_event 串 task.id）与任务主条进同一视图
+    events.extend(_timeline_record_message(m, lane=m.from_agent) for m in msgs)
+    return {"mode": "task", "key": key, "events": events,
+            "truncated": len(msgs) >= limit}
+
+
+def _render_admin_html(data: dict[str, Any], mcp_url: str = "", admin_token: str = "") -> str:
     def _rows(items: list[dict[str, Any]], cols: list[str]) -> str:
         if not items:
             return "<tr><td colspan='99' class='empty'>暂无数据</td></tr>"
@@ -427,7 +555,8 @@ code {{
 <body>
 <div class="wrap">
 <h1>🏠 MCP Harbor</h1>
-<p class="subtitle">契约注册、发现与通知中心 — 管理全貌（仅 admin 可见）</p>
+<p class="subtitle">契约注册、发现与通知中心 — 管理全貌（仅 admin 可见）
+  · <a href="/admin/timeline?token={quote(admin_token)}">🕐 会话时序图</a></p>
 
 {connection_card}
 
@@ -479,6 +608,507 @@ code {{
 
 </div>
 </body></html>"""
+
+
+# 时序图页面模板。用普通字符串 + __TOKEN_ATTR__ 占位符替换而不是 f-string：
+# 这是本项目第一段成规模的前端 JS/CSS，f-string 里全量双写 {{ }} 极易出错。
+# 动态文本一律走 JSON + textContent，正文不进 innerHTML（消息是 agent 可控内容，防 XSS）。
+_TIMELINE_PAGE = """
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>会话时序图 · MCP Harbor Admin</title>
+<style>
+* { box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  margin: 0; padding: 1.5rem; color: #1e293b; background: #f1f5f9; line-height: 1.5;
+}
+.wrap { max-width: 1200px; margin: 0 auto; }
+h1 { margin: 0 0 0.3rem; font-size: 1.4rem; }
+.subtitle { color: #64748b; margin: 0 0 1.2rem; font-size: 0.9rem; }
+.subtitle a { color: #2563eb; text-decoration: none; }
+.card {
+  background: white; border-radius: 10px; padding: 1rem 1.2rem;
+  margin-bottom: 1.2rem; box-shadow: 0 1px 3px rgba(0,0,0,0.08); border: 1px solid #e2e8f0;
+}
+.hint { font-size: 0.8rem; color: #64748b; margin: 0.6rem 0 0; }
+.topbar { display: flex; align-items: center; gap: 0.8rem; flex-wrap: wrap; margin-bottom: 1rem; }
+.topbar h1 { margin: 0; }
+.tz-btn, .tab {
+  border: 1px solid #cbd5e1; background: white; border-radius: 6px; padding: 4px 12px;
+  font-size: 0.82rem; cursor: pointer; color: #334155;
+}
+.tab.active { background: #2563eb; border-color: #2563eb; color: white; }
+.tz-btn:hover, .tab:hover { background: #f1f5f9; }
+.tab.active:hover { background: #1d4ed8; }
+.layout { display: flex; gap: 1.2rem; align-items: flex-start; flex-wrap: wrap; }
+.list-panel { flex: 0 0 320px; max-width: 100%; }
+.wf-panel { flex: 1; min-width: 320px; overflow-x: auto; }
+.tabs { display: flex; gap: 0.5rem; margin-bottom: 0.8rem; }
+.item {
+  border: 1px solid #e2e8f0; border-radius: 8px; padding: 0.6rem 0.8rem;
+  margin-bottom: 0.5rem; cursor: pointer;
+}
+.item:hover { background: #f8fafc; }
+.item.sel { border-color: #2563eb; background: #eff6ff; }
+.item .t { font-size: 0.88rem; font-weight: 600; word-break: break-all; }
+.item .m { font-size: 0.76rem; color: #64748b; margin-top: 2px; }
+.badge { display: inline-block; padding: 0 6px; border-radius: 4px; font-size: 0.72rem; color: white; }
+.empty { text-align: center; color: #94a3b8; padding: 1.5rem; font-size: 0.86rem; }
+.err { color: #dc2626; font-size: 0.85rem; margin: 0.4rem 0 0; white-space: pre-wrap; }
+.wf-axis { position: relative; height: 22px; margin-left: 170px; }
+.wf-axis span {
+  position: absolute; transform: translateX(-50%); font-size: 0.68rem; color: #94a3b8; white-space: nowrap;
+}
+.lane { display: flex; align-items: stretch; min-height: 38px; border-bottom: 1px solid #f1f5f9; }
+.lane-label {
+  flex: 0 0 170px; font-size: 0.78rem; color: #334155; padding: 6px 8px 6px 0;
+  word-break: break-all; font-weight: 600;
+}
+.lane-label .sub { display: block; font-weight: 400; color: #94a3b8; font-size: 0.7rem; }
+.track { flex: 1; position: relative; min-width: 200px; }
+.gridline { position: absolute; top: 0; bottom: 0; width: 1px; background: #eef2f7; }
+.dot {
+  position: absolute; width: 10px; height: 10px; border-radius: 50%;
+  transform: translateX(-50%); top: 6px; cursor: pointer;
+}
+.dot:hover { outline: 2px solid rgba(37,99,235,0.35); }
+.seg { position: absolute; height: 4px; border-radius: 2px; transform: translateX(0); cursor: pointer; }
+.seg.read { background: #16a34a; top: 19px; opacity: 0.85; }
+.seg.ack { background: #f59e0b; top: 25px; opacity: 0.85; }
+.tbar { position: absolute; top: 12px; height: 12px; border-radius: 6px; cursor: pointer; min-width: 4px; }
+.tbar.open { border-right: 3px dotted currentColor; border-radius: 6px 0 0 6px; }
+.tick { position: absolute; top: 9px; width: 2px; height: 18px; background: #475569; cursor: pointer; }
+#tooltip {
+  position: fixed; display: none; max-width: 380px; background: #0f172a; color: #e2e8f0;
+  padding: 8px 10px; border-radius: 8px; font-size: 0.76rem; line-height: 1.5; z-index: 50;
+  pointer-events: none; word-break: break-all; box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+}
+#tooltip .tt-label { color: #93c5fd; font-weight: 600; }
+#tooltip .tt-dim { color: #94a3b8; }
+.legend { font-size: 0.74rem; color: #64748b; margin-top: 0.8rem; }
+.legend i {
+  display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin: 0 3px 0 10px;
+}
+@media (max-width: 700px) { .list-panel { flex-basis: 100%; } .wf-axis { margin-left: 110px; } .lane-label { flex-basis: 110px; } }
+</style></head>
+<body data-token="__TOKEN_ATTR__">
+<div class="wrap">
+<div class="topbar">
+  <h1>🕐 会话时序图</h1>
+  <button class="tz-btn" id="tzBtn"></button>
+  <span style="flex:1"></span>
+  <a class="tz-btn" id="backLink" style="text-decoration:none;display:inline-block;">← 返回 Admin</a>
+</div>
+<p class="subtitle">按时间轴回看一次协作里发生了什么：消息、任务流转、已读/确认时延 — 仅 admin 可见</p>
+
+<div class="layout">
+<div class="card list-panel">
+  <div class="tabs">
+    <button class="tab" id="tabPair">💬 Agent 会话</button>
+    <button class="tab" id="tabTask">📋 任务</button>
+  </div>
+  <div id="listBox"><div class="empty">加载中…</div></div>
+  <p class="err" id="listErr"></p>
+</div>
+<div class="card wf-panel">
+  <div id="wfTitle" style="font-weight:600; margin-bottom:0.4rem; font-size:0.95rem;"></div>
+  <div id="wfHint" class="hint" style="margin:0 0 0.4rem;"></div>
+  <div id="waterfall"><div class="empty">← 从左侧选一段会话或一条任务</div></div>
+  <p class="err" id="wfErr"></p>
+  <div class="legend" id="legend" hidden>
+    时延段：<i style="background:#16a34a"></i>发出→被读
+    <i style="background:#f59e0b"></i>发出→被确认(ack)
+    <i style="background:#7c3aed"></i>任务回执消息
+  </div>
+</div>
+</div>
+</div>
+<div id="tooltip"></div>
+<script>
+"use strict";
+var TOKEN = document.body.dataset.token;
+var useUTC = false;                 // 库里全 UTC，默认转本地显示；按钮切换
+var lastListMode = 'pair';
+var lastListData = null;
+var lastDetail = null;              // {mode, key, data} 时区切换后重画
+var selItem = null;
+
+var $ = function (id) { return document.getElementById(id); };
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+  return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+
+function fmtTime(iso) {
+  if (!iso) return '—';
+  var d = new Date(iso);
+  if (isNaN(d)) return iso;
+  var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+  if (useUTC) {
+    return pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate()) + ' ' +
+      pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ':' + pad(d.getUTCSeconds()) + ' UTC';
+  }
+  return pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' +
+    pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+}
+function fmtDur(ms) {
+  if (ms == null || isNaN(ms)) return null;
+  if (ms < 1000) return ms + 'ms';
+  var s = Math.round(ms / 1000);
+  if (s < 60) return s + ' 秒';
+  var m = Math.floor(s / 60); s = s % 60;
+  if (m < 60) return m + ' 分' + (s ? ' ' + s + ' 秒' : '');
+  var h = Math.floor(m / 60); m = m % 60;
+  if (h < 24) return h + ' 小时' + (m ? ' ' + m + ' 分' : '');
+  return Math.floor(h / 24) + ' 天' + (h % 24 ? ' ' + (h % 24) + ' 小时' : '');
+}
+function fmtDate(iso) {
+  var d = new Date(iso); if (isNaN(d)) return iso || '—';
+  var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+  if (useUTC) return d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate());
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+}
+var STATUS_BADGE = {
+  created: '#64748b', accepted: '#0ea5e9', working: '#2563eb', input_required: '#f59e0b',
+  completed: '#16a34a', failed: '#dc2626', canceled: '#9ca3af', rejected: '#9ca3af'
+};
+var KIND_COLOR = { chat: '#2563eb', task_event: '#7c3aed', admin_command: '#ea580c' };
+
+function showErr(el, msg) { $(el).textContent = msg || ''; }
+function showError(msg) { showErr('wfErr', msg); }
+
+function apiUrl(params) {
+  var p = new URLSearchParams({ token: TOKEN });
+  Object.keys(params).forEach(function (k) { if (params[k] != null) p.set(k, params[k]); });
+  return '/admin/api/timeline?' + p.toString();
+}
+function api(params) {
+  return fetch(apiUrl(params)).then(function (r) {
+    if (r.status === 403) return r.json().then(function (e) {
+      throw new Error(e.error || 'admin_token 无效'); });
+    if (!r.ok) return r.json().catch(function () { return {}; }).then(function (e) {
+      throw new Error(e.error || ('请求失败 HTTP ' + r.status)); });
+    return r.json();
+  });
+}
+
+/* ── 左侧列表 ── */
+function setTab(mode) {
+  lastListMode = mode;
+  $('tabPair').className = 'tab' + (mode === 'pair' ? ' active' : '');
+  $('tabTask').className = 'tab' + (mode === 'task' ? ' active' : '');
+  loadList();
+}
+function loadList() {
+  showErr('listErr', '');
+  $('listBox').innerHTML = '<div class="empty">加载中…</div>';
+  api({ mode: 'list' }).then(function (data) {
+    lastListData = data;
+    renderList();
+  }).catch(function (e) {
+    $('listBox').innerHTML = '';
+    showErr('listErr', '加载失败：' + e.message);
+  });
+}
+function renderList() {
+  var box = $('listBox');
+  box.innerHTML = '';
+  if (lastListMode === 'pair') {
+    var pairs = (lastListData && lastListData.pairs) || [];
+    if (!pairs.length) { box.innerHTML = '<div class="empty">还没有任何私信往来</div>'; return; }
+    pairs.forEach(function (p) {
+      var div = document.createElement('div');
+      div.className = 'item';
+      div.dataset.mode = 'pair'; div.dataset.key = p.a + '|' + p.b;
+      var t = document.createElement('div'); t.className = 't';
+      t.textContent = p.a + ' ↔ ' + p.b;
+      var m = document.createElement('div'); m.className = 'm';
+      m.textContent = p.total + ' 条（chat ' + p.chat_n + '）· ack ' + p.acked_n +
+        ' · 最后 ' + fmtTime(p.last_at);
+      div.appendChild(t); div.appendChild(m);
+      box.appendChild(div);
+    });
+  } else {
+    var tasks = (lastListData && lastListData.tasks) || [];
+    if (!tasks.length) { box.innerHTML = '<div class="empty">还没有任务</div>'; return; }
+    tasks.forEach(function (tk) {
+      var div = document.createElement('div');
+      div.className = 'item';
+      div.dataset.mode = 'task'; div.dataset.key = tk.id;
+      var t = document.createElement('div'); t.className = 't';
+      var b = document.createElement('span'); b.className = 'badge';
+      b.style.background = STATUS_BADGE[tk.status] || '#64748b';
+      b.textContent = tk.status;
+      t.appendChild(b);
+      t.appendChild(document.createTextNode(' #' + tk.id));
+      var tt = document.createElement('div'); tt.style.fontWeight = '400';
+      tt.textContent = tk.title;
+      t.appendChild(tt);
+      var m = document.createElement('div'); m.className = 'm';
+      var dur = fmtDur(new Date(tk.updated_at) - new Date(tk.created_at));
+      m.textContent = (tk.creator || '?') + ' → ' + (tk.assignee || '?') +
+        ' · 历时 ' + (dur || '—') + ' · ' + fmtDate(tk.updated_at);
+      div.appendChild(t); div.appendChild(m);
+      box.appendChild(div);
+    });
+  }
+  if (selItem) markSel();
+}
+function onListClick(ev) {
+  var it = ev.target.closest('.item');
+  if (!it) return;
+  selectItem(it);
+}
+function markSel() {
+  var items = $('listBox').querySelectorAll('.item');
+  for (var i = 0; i < items.length; i++) {
+    var on = lastDetail && items[i].dataset.mode === lastDetail.mode &&
+             items[i].dataset.key === lastDetail.key;
+    items[i].className = 'item' + (on ? ' sel' : '');
+    if (on) selItem = items[i];
+  }
+}
+function selectItem(it) {
+  selItem = it;
+  var items = $('listBox').querySelectorAll('.item');
+  for (var i = 0; i < items.length; i++) items[i].className = 'item';
+  it.className = 'item sel';
+  loadDetail(it.dataset.mode, it.dataset.key);
+}
+
+/* ── 右侧瀑布 ── */
+function loadDetail(mode, key) {
+  showErr('wfErr', '');
+  $('waterfall').innerHTML = '<div class="empty">加载中…</div>';
+  api({ mode: mode, key: key }).then(function (data) {
+    lastDetail = { mode: mode, key: key, data: data };
+    renderDetail();
+  }).catch(function (e) {
+    $('waterfall').innerHTML = '';
+    showError('加载失败：' + e.message);
+  });
+}
+function renderDetail() {
+  if (!lastDetail) return;
+  var data = lastDetail.data;
+  var events = data.events || [];
+  $('wfTitle').textContent = lastDetail.mode === 'pair'
+    ? (data.a + ' ↔ ' + data.b + '（' + events.length + ' 条消息）')
+    : ('任务线：' + lastDetail.key + '（' + events.length + ' 个事件）');
+  $('wfHint').textContent = data.truncated
+    ? '⚠ 事件数超过单次上限，只显示了最早的一部分' : '';
+  $('legend').hidden = !events.length;
+  if (!events.length) {
+    $('waterfall').innerHTML = '<div class="empty">这段会话还没有事件</div>';
+    return;
+  }
+  renderWaterfall(events);
+}
+
+var records = {};   // recId -> record（tooltip 取数用）
+var wfT0 = 0, wfSpan = 1;   // 当前瀑布的时间起点/跨度 ms（位置与宽度换算用）
+function posLeft(ms) { return ((ms - wfT0) / wfSpan * 100).toFixed(3) + '%'; }
+function posW(ms) { return Math.max(ms / wfSpan * 100, 0.4).toFixed(3) + '%'; }
+
+function renderWaterfall(events) {
+  records = {};
+  var t0 = Infinity, t1 = -Infinity, i, e;
+  for (i = 0; i < events.length; i++) {
+    e = events[i];
+    records[e.id] = e;
+    var s = Date.parse(e.ts);
+    if (!isNaN(s)) { if (s < t0) t0 = s; if (s > t1) t1 = s; }
+    if (e.ts_end) { var en = Date.parse(e.ts_end); if (!isNaN(en) && en > t1) t1 = en; }
+  }
+  if (!isFinite(t0)) { $('waterfall').innerHTML = '<div class="empty">事件缺少时间戳</div>'; return; }
+  wfT0 = t0; wfSpan = Math.max(t1 - t0, 1000);
+
+  // 泳道：按首次出现顺序；任务主条行排最前
+  var lanes = [], laneInfo = {};
+  events.slice().sort(function (a, b) {
+    return (a.type === 'task' ? -1 : 1) - (b.type === 'task' ? -1 : 1);
+  }).forEach(function (e) {
+    if (!laneInfo[e.lane]) {
+      laneInfo[e.lane] = { key: e.lane,
+                           label: e.type === 'task' ? ('📋 ' + e.title) : e.lane,
+                           sub: e.type === 'task' ? (e.creator + ' → ' + e.assignee) : null,
+                           n: 0 };
+      lanes.push(laneInfo[e.lane]);
+    }
+    laneInfo[e.lane].n++;
+  });
+
+  // 时间轴刻度：候选步长里取刻度数 ≤10 的最小步长
+  var steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800,
+               21600, 43200, 86400, 172800, 604800];
+  var step = steps[steps.length - 1];
+  for (i = 0; i < steps.length; i++) {
+    if (wfSpan / 1000 / steps[i] <= 10) { step = steps[i]; break; }
+  }
+  var axis = $('waterfall');
+  axis.innerHTML = '';
+  var axisRow = document.createElement('div'); axisRow.className = 'wf-axis';
+  var body = document.createElement('div'); body.style.position = 'relative';
+  for (var t = Math.ceil(t0 / 1000 / step) * step * 1000; t <= t1; t += step * 1000) {
+    var lbl = document.createElement('span');
+    lbl.style.left = posLeft(t);
+    lbl.textContent = fmtTime(new Date(t).toISOString()).replace(/ UTC$/, '');
+    axisRow.appendChild(lbl);
+    var gl = document.createElement('div'); gl.className = 'gridline';
+    gl.style.left = posLeft(t);
+    body.appendChild(gl);
+  }
+  axis.appendChild(axisRow);
+  axis.appendChild(body);
+
+  lanes.forEach(function (lane) {
+    var row = document.createElement('div'); row.className = 'lane';
+    var lab = document.createElement('div'); lab.className = 'lane-label';
+    lab.appendChild(document.createTextNode(lane.label));
+    var sub = document.createElement('span'); sub.className = 'sub';
+    sub.textContent = (lane.sub ? lane.sub + ' · ' : '') + lane.n + ' 条';
+    lab.appendChild(sub);
+    var track = document.createElement('div'); track.className = 'track';
+    events.forEach(function (ev) {
+      if (ev.lane !== lane.key) return;
+      if (ev.type === 'task') drawTaskBar(track, ev);
+      else drawMessage(track, ev);
+    });
+    row.appendChild(lab); row.appendChild(track);
+    body.appendChild(row);
+  });
+}
+
+function drawMessage(track, ev) {
+  var s = Date.parse(ev.ts); if (isNaN(s)) return;
+  // 已读等待（绿）/ ack 等待（琥珀）：服务端算好的毫秒数；旧数据为 null 不画
+  var rw = ev.latency && ev.latency.read_wait_ms;
+  if (rw != null && rw > 0) {
+    var sr = document.createElement('div'); sr.className = 'seg read';
+    sr.style.left = posLeft(s); sr.style.width = posW(rw);
+    sr.dataset.recId = ev.id;
+    track.appendChild(sr);
+  }
+  var aw = ev.latency && ev.latency.ack_wait_ms;
+  if (aw != null && aw > 0) {
+    var sa = document.createElement('div'); sa.className = 'seg ack';
+    sa.style.left = posLeft(s); sa.style.width = posW(aw);
+    sa.dataset.recId = ev.id;
+    track.appendChild(sa);
+  }
+  var dot = document.createElement('div'); dot.className = 'dot';
+  dot.style.background = KIND_COLOR[ev.kind] || '#94a3b8';
+  dot.style.left = posLeft(s);
+  dot.dataset.recId = ev.id;
+  track.appendChild(dot);
+}
+
+function drawTaskBar(track, ev) {
+  var s = Date.parse(ev.ts), en = Date.parse(ev.ts_end);
+  if (isNaN(s)) return;
+  if (isNaN(en)) en = s;
+  var color = STATUS_BADGE[ev.status] || '#64748b';
+  var bar = document.createElement('div');
+  bar.className = 'tbar' + (ev.open ? ' open' : '');
+  bar.style.left = posLeft(s);
+  bar.style.width = posW(Math.max(en - s, 0));
+  bar.style.background = color;
+  bar.style.color = color;              // open 态右端虚线用 currentColor
+  if (ev.open) bar.style.opacity = '0.55';
+  bar.dataset.recId = ev.id;
+  track.appendChild(bar);
+  (ev.ticks || []).forEach(function (tk) {
+    var ts = Date.parse(tk.ts); if (isNaN(ts)) return;
+    var tick = document.createElement('div'); tick.className = 'tick';
+    tick.style.left = posLeft(ts);
+    tick.dataset.recId = ev.id;
+    tick.dataset.tickLabel = tk.label + ' @ ' + fmtTime(tk.ts) + '（' + tk.actor + '）';
+    track.appendChild(tick);
+  });
+}
+
+/* ── tooltip：一律 textContent，正文不进 innerHTML ── */
+function tooltipLines(rec) {
+  var out = [];
+  function line(label, value) {
+    var row = document.createElement('div');
+    var l = document.createElement('span'); l.className = 'tt-label';
+    l.textContent = label + '：';
+    row.appendChild(l);
+    row.appendChild(document.createTextNode(value == null || value === '' ? '—' : value));
+    out.push(row);
+  }
+  if (rec.type === 'task') {
+    var head = document.createElement('div');
+    head.className = 'tt-label';
+    head.textContent = '📋 任务 #' + rec.id + ' ' + rec.title;
+    out.push(head);
+    line('状态', rec.status + (rec.open ? '（进行中）' : ''));
+    line('参与', rec.creator + ' → ' + rec.assignee);
+    line('创建', fmtTime(rec.ts));
+    line(rec.open ? '至今' : '终态', fmtTime(rec.ts_end) +
+      '（历时 ' + (fmtDur(Date.parse(rec.ts_end) - Date.parse(rec.ts)) || '?') + '）');
+    if (rec.deadline) line('截止', rec.deadline);
+    if (rec.result) line('结果', rec.result);
+    (rec.ticks || []).forEach(function (tk) {
+      line(tk.label, fmtTime(tk.ts) + '（' + tk.actor + '）');
+    });
+  } else {
+    var kindName = { chat: '💬 私信', task_event: '🔔 任务回执', admin_command: '📣 admin 指令' }[rec.kind] || rec.kind;
+    var head2 = document.createElement('div');
+    head2.className = 'tt-label';
+    head2.textContent = kindName + '　' + rec.from + ' → ' + rec.to;
+    out.push(head2);
+    line('时间', fmtTime(rec.ts));
+    line('已读等待', (rec.latency && fmtDur(rec.latency.read_wait_ms)) ||
+      (rec.read ? '已读（时间未知）' : '未读'));
+    line('ack 等待', (rec.latency && fmtDur(rec.latency.ack_wait_ms)) ||
+      (rec.acked ? '已确认（时间未知）' : '未确认'));
+    if (rec.correlation_id) line('线程', rec.correlation_id);
+    if (rec.text) line('正文', rec.text);
+  }
+  return out;
+}
+document.addEventListener('mousemove', function (ev) {
+  var tip = $('tooltip');
+  var el = ev.target && ev.target.closest ? ev.target.closest('[data-rec-id]') : null;
+  var rec = el && records[el.dataset.recId];
+  if (!rec) { tip.style.display = 'none'; return; }
+  tip.innerHTML = '';
+  if (el.dataset.tickLabel) {
+    var tl = document.createElement('div');
+    tl.textContent = '▸ ' + el.dataset.tickLabel;
+    tip.appendChild(tl);
+  }
+  tooltipLines(rec).forEach(function (row) { tip.appendChild(row); });
+  tip.style.display = 'block';
+  var x = ev.clientX + 14, y = ev.clientY + 14;
+  if (x + 400 > window.innerWidth) x = Math.max(ev.clientX - 410, 8);
+  if (y + tip.offsetHeight > window.innerHeight) y = Math.max(window.innerHeight - tip.offsetHeight - 8, 8);
+  tip.style.left = x + 'px'; tip.style.top = y + 'px';
+});
+
+/* ── 初始化 ── */
+$('tzBtn').addEventListener('click', function () {
+  useUTC = !useUTC;
+  $('tzBtn').textContent = useUTC ? '当前：UTC（点击切本地）' : '当前：本地时间（点击切 UTC）';
+  if (lastListData) renderList();
+  renderDetail();
+});
+$('tabPair').addEventListener('click', function () { setTab('pair'); });
+$('tabTask').addEventListener('click', function () { setTab('task'); });
+$('listBox').addEventListener('click', onListClick);
+$('backLink').href = '/admin?token=' + encodeURIComponent(TOKEN);
+$('tzBtn').textContent = '当前：本地时间（点击切 UTC）';
+loadList();
+</script>
+</body></html>
+"""
+
+
+def _render_timeline_html(admin_token: str = "") -> str:
+    """时序图子页。token 只经 body data-* 属性注入（html.escape 转义），
+    JS 从 dataset 读；消息正文等用户可控内容永远走 JSON + textContent。"""
+    return _TIMELINE_PAGE.replace("__TOKEN_ATTR__", html.escape(admin_token, quote=True))
 
 
 def _generate_change_summary(old: Manifest | None, new: Manifest) -> str:
@@ -1951,7 +2581,47 @@ async def admin_dashboard(request):
 
     data = _collect_admin_overview()
     mcp_url = str(request.base_url).rstrip("/") + "/mcp"
-    return HTMLResponse(_render_admin_html(data, mcp_url))
+    return HTMLResponse(_render_admin_html(data, mcp_url, admin_token=admin_token))
+
+
+@mcp.custom_route("/admin/timeline", methods=["GET"])
+async def admin_timeline_page(request):
+    """会话时序图子页（Chrome DevTools Network 式瀑布图）。鉴权与 /admin 同一套。"""
+    from starlette.responses import HTMLResponse
+
+    admin_token = request.query_params.get("token", "")
+    err = _check_admin(admin_token)
+    if err:
+        return HTMLResponse(f"<h1>403</h1><p>{html.escape(err)}</p>", status_code=403)
+    return HTMLResponse(_render_timeline_html(admin_token=admin_token))
+
+
+@mcp.custom_route("/admin/api/timeline", methods=["GET"])
+async def admin_timeline_api(request):
+    """时序图取数 API。mode=list 会话/任务列表；mode=pair&key=a|b 按 agent 对；
+    mode=task&key=<task_id|correlation_id> 按任务线。只读，不落任何审计。"""
+    from starlette.responses import JSONResponse
+
+    admin_token = request.query_params.get("token", "")
+    err = _check_admin(admin_token)
+    if err:
+        return JSONResponse({"error": err}, status_code=403)
+
+    mode = request.query_params.get("mode", "list")
+    if mode not in ("list", "pair", "task"):
+        return JSONResponse(
+            {"error": f"mode 只支持 list / pair / task，收到 {mode!r}"}, status_code=400)
+    key = request.query_params.get("key", "")
+    if mode in ("pair", "task") and not key:
+        return JSONResponse(
+            {"error": f"mode={mode} 需要 key 参数（pair 用 'a|b'，task 用 task_id 或 correlation_id）"},
+            status_code=400)
+    try:
+        limit = int(request.query_params.get("limit", "500"))
+    except ValueError:
+        return JSONResponse({"error": "limit 必须是整数"}, status_code=400)
+    limit = max(1, min(limit, 1000))
+    return JSONResponse(_build_timeline_payload(mode=mode, key=key, limit=limit))
 
 
 # ═══════════════════════════════════════════════════════════════════

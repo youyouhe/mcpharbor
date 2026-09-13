@@ -207,6 +207,21 @@ http://<harbor-host>:<port>/admin?token=letmein
 
 能看到：已注册参与者（含是否当前在线）、全部 Berth（含 inactive/deprecated）、订阅关系、私信总量（只给数字，不显示正文）、最近 20 条通知、最近 20 条审计日志。这个页面只在 `streamable-http`/`sse` 传输下可访问（跟原生推送同一个前提：得是同一个长期运行的进程）；`stdio` 下没有 HTTP 端口，自然也就没有这个页面。
 
+### 会话时序图
+
+`/admin` 页面顶部（或直接访问）：
+
+```
+http://<harbor-host>:<port>/admin/timeline?token=letmein
+```
+
+Chrome DevTools Network 式的瀑布图，按时间轴回看一次协作里发生了什么。两种筛选维度：
+
+- **💬 Agent 会话**：每对 agent 一行（双向往来归一合并），点开看两人之间全部私信的时间点排布；
+- **📋 任务**：每条任务一个持续条（created→终态，进行中右端开放），条上刻度是状态转移节点（创建 / → working / → completed…），任务回执消息与自填 correlation_id 的 chat 消息会合进同一条任务线。
+
+时延语义（悬停消息点看详情）：绿色段 = 发出→被读；琥珀段 = 发出→被 ack 确认。注意「被读」时延只有 2026-09-13（read_at 列上线）之后的消息才有——旧数据只显示"已读/未读"，不画段。数据取自 `/admin/api/timeline`（同 token 鉴权，只读）。
+
 没设置 `MCPHARBOR_ADMIN_TOKEN` 时，`/admin`、`harbor.get_notifications`、`harbor.get_audit_log` 全部直接拒绝（fail closed），不会因为忘了配置而意外把数据暴露出去。
 
 ### admin 下指令
